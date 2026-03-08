@@ -23,6 +23,11 @@ type Model struct {
 	Aliases     []string `json:"aliases,omitempty"`
 }
 
+type prometheusHTTPSDTargetGroup struct {
+	Targets []string          `json:"targets"`
+	Labels  map[string]string `json:"labels,omitempty"`
+}
+
 func addApiHandlers(pm *ProxyManager) {
 	// Add API endpoints for React to consume
 	// Protected with API key authentication
@@ -32,6 +37,7 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.POST("/models/unload/*model", pm.apiUnloadSingleModelHandler)
 		apiGroup.GET("/events", pm.apiSendEvents)
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
+		apiGroup.GET("/prometheus/http_sd", pm.apiGetPrometheusHTTPSD)
 		apiGroup.GET("/version", pm.apiGetVersion)
 		apiGroup.GET("/captures/:id", pm.apiGetCapture)
 	}
@@ -244,6 +250,42 @@ func (pm *ProxyManager) apiGetMetrics(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "application/json", jsonData)
+}
+
+func (pm *ProxyManager) apiGetPrometheusHTTPSD(c *gin.Context) {
+	scheme := "http"
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
+
+	host := strings.TrimSpace(c.Request.Host)
+	if host == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "request host required"})
+		return
+	}
+
+	models := pm.getModelStatus()
+	targetGroups := make([]prometheusHTTPSDTargetGroup, 0, len(models))
+	for _, model := range models {
+		if model.PeerID != "" || model.State != "ready" {
+			continue
+		}
+
+		targetGroups = append(targetGroups, prometheusHTTPSDTargetGroup{
+			Targets: []string{host},
+			Labels: map[string]string{
+				"__scheme__":       scheme,
+				"__metrics_path__": "/upstream/" + model.Id + "/metrics",
+				"job":              "llama.cpp",
+				"model":            model.Id,
+				"model_name":       model.Name,
+				"state":            model.State,
+				"managed_by":       "llama-swap",
+			},
+		})
+	}
+
+	c.JSON(http.StatusOK, targetGroups)
 }
 
 func (pm *ProxyManager) apiUnloadSingleModelHandler(c *gin.Context) {

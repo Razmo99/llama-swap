@@ -519,6 +519,53 @@ func TestProxyManager_ListModelsHandler_IncludeAliasesInList(t *testing.T) {
 	assert.Equal(t, name1, name2)
 }
 
+func TestProxyManager_PrometheusHTTPSD_OnlyRunningLocalModels(t *testing.T) {
+	cfg := config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		Models: map[string]config.ModelConfig{
+			"model1": getTestSimpleResponderConfig("model1"),
+			"model2": getTestSimpleResponderConfig("model2"),
+		},
+		Peers: map[string]config.PeerConfig{
+			"peer1": {
+				Proxy:  "http://peer1:8080",
+				Models: []string{"peer-model-a"},
+			},
+		},
+		LogLevel: "error",
+	})
+
+	proxy := New(cfg)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+
+	startReq := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"model1"}`))
+	startRec := CreateTestResponseRecorder()
+	proxy.ServeHTTP(startRec, startReq)
+	assert.Equal(t, http.StatusOK, startRec.Code)
+
+	req := httptest.NewRequest("GET", "/api/prometheus/http_sd", nil)
+	req.Host = "llama-swap.example:8080"
+	w := CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var response []struct {
+		Targets []string          `json:"targets"`
+		Labels  map[string]string `json:"labels"`
+	}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Len(t, response, 1)
+	assert.Equal(t, []string{"llama-swap.example:8080"}, response[0].Targets)
+	assert.Equal(t, "/upstream/model1/metrics", response[0].Labels["__metrics_path__"])
+	assert.Equal(t, "http", response[0].Labels["__scheme__"])
+	assert.Equal(t, "llama.cpp", response[0].Labels["job"])
+	assert.Equal(t, "model1", response[0].Labels["model"])
+	assert.Equal(t, "ready", response[0].Labels["state"])
+	assert.Equal(t, "llama-swap", response[0].Labels["managed_by"])
+	assert.NotContains(t, w.Body.String(), "model2")
+	assert.NotContains(t, w.Body.String(), "peer-model-a")
+}
+
 func TestProxyManager_Shutdown(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping slow test")
