@@ -41,8 +41,8 @@ type composeService struct {
 }
 
 type generatedConfig struct {
-	HealthCheckTimeout int                        `yaml:"healthCheckTimeout"`
-	LogLevel           string                     `yaml:"logLevel"`
+	HealthCheckTimeout int                       `yaml:"healthCheckTimeout"`
+	LogLevel           string                    `yaml:"logLevel"`
 	Models             map[string]generatedModel `yaml:"models"`
 }
 
@@ -62,6 +62,7 @@ type generatedModel struct {
 func main() {
 	var composePath string
 	var outputPath string
+	var baseConfigPath string
 	var projectName string
 	var envFile string
 	var profile string
@@ -70,6 +71,7 @@ func main() {
 
 	flag.StringVar(&composePath, "compose-file", "", "path to docker-compose.yml")
 	flag.StringVar(&outputPath, "output", "", "path to generated llama-swap config")
+	flag.StringVar(&baseConfigPath, "base-config", "", "path to base llama-swap config to merge generated models into")
 	flag.StringVar(&projectName, "project-name", "project", "compose project name used for nested compose commands")
 	flag.StringVar(&envFile, "env-file", "", "env file path used for nested compose commands")
 	flag.StringVar(&profile, "profile", "models", "compose profile used for managed model services")
@@ -98,7 +100,12 @@ func main() {
 		exitf("failed to build config: %v", err)
 	}
 
-	if err := writeConfig(outputPath, generated); err != nil {
+	mergedConfig, err := mergeBaseConfig(baseConfigPath, generated)
+	if err != nil {
+		exitf("failed to merge base config: %v", err)
+	}
+
+	if err := writeConfig(outputPath, mergedConfig); err != nil {
 		exitf("failed to write config: %v", err)
 	}
 }
@@ -307,7 +314,30 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func writeConfig(path string, cfg generatedConfig) error {
+func mergeBaseConfig(path string, generated generatedConfig) (map[string]any, error) {
+	out := map[string]any{}
+	if strings.TrimSpace(path) != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := yaml.Unmarshal(data, &out); err != nil {
+			return nil, err
+		}
+	}
+
+	if _, exists := out["healthCheckTimeout"]; !exists {
+		out["healthCheckTimeout"] = generated.HealthCheckTimeout
+	}
+	if _, exists := out["logLevel"]; !exists {
+		out["logLevel"] = generated.LogLevel
+	}
+
+	out["models"] = generated.Models
+	return out, nil
+}
+
+func writeConfig(path string, cfg map[string]any) error {
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
