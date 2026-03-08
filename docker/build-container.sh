@@ -126,12 +126,19 @@ if [[ ! -z "$DEBUG_ABORT_BUILD" ]]; then
     exit 0
 fi
 
+GIT_HASH=$(git -C .. rev-parse --short HEAD)
+if [[ -n "$(git -C .. status --porcelain)" ]]; then
+  GIT_HASH="${GIT_HASH}+"
+fi
+BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
 for CONTAINER_TYPE in non-root root; do
   CONTAINER_TAG="ghcr.io/${LS_REPO}:v${LS_VER}-${ARCH}-${LCPP_TAG}"
   CONTAINER_LATEST="ghcr.io/${LS_REPO}:${ARCH}"
   USER_UID=0
   USER_GID=0
   USER_HOME=/root
+  INSTALL_PODMAN=0
 
   if [ "$CONTAINER_TYPE" == "non-root" ]; then
     CONTAINER_TAG="${CONTAINER_TAG}-non-root"
@@ -139,12 +146,17 @@ for CONTAINER_TYPE in non-root root; do
     USER_UID=10001
     USER_GID=10001
     USER_HOME=/app
+    if [ "$ARCH" == "cpu" ]; then
+      INSTALL_PODMAN=1
+    fi
   fi
 
   log_info "Building $CONTAINER_TYPE $CONTAINER_TAG $LS_VER"
-  docker build --provenance=false -f llama-swap.Containerfile --build-arg BASE_TAG=${BASE_TAG} --build-arg LS_VER=${LS_VER} --build-arg UID=${USER_UID} \
-    --build-arg LS_REPO=${LS_REPO} --build-arg GID=${USER_GID} --build-arg USER_HOME=${USER_HOME} -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} \
-    --build-arg BASE_IMAGE=${BASE_IMAGE} .
+  docker build --provenance=false -f docker/llama-swap.Containerfile --build-arg BASE_TAG=${BASE_TAG} --build-arg UID=${USER_UID} \
+    --build-arg GID=${USER_GID} --build-arg USER_HOME=${USER_HOME} --build-arg INSTALL_PODMAN=${INSTALL_PODMAN} \
+    --build-arg BASE_IMAGE=${BASE_IMAGE} --build-arg VERSION=local_${GIT_HASH} --build-arg COMMIT=${GIT_HASH} \
+    --build-arg BUILD_DATE=${BUILD_DATE} -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} \
+    ..
 
   # For architectures with stable-diffusion.cpp support, layer sd-server on top
   case "$ARCH" in
