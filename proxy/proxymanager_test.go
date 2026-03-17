@@ -781,6 +781,64 @@ func TestProxyManager_RunningEndpoint(t *testing.T) {
 	})
 }
 
+func TestProxyManager_StoppedMetricsEndpointDoesNotStartModel(t *testing.T) {
+	config := config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		Models: map[string]config.ModelConfig{
+			"model1": getTestSimpleResponderConfig("model1"),
+		},
+		LogLevel: "error",
+	})
+
+	proxy := New(config)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+
+	req := httptest.NewRequest("GET", "/upstream/model1/metrics", nil)
+	w := CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, StateStopped, proxy.findGroupByModelName("model1").processes["model1"].CurrentState())
+}
+
+func TestProxyManager_StoppedMetricsEndpointDoesNotEvictRunningModel(t *testing.T) {
+	cfg := config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		Models: map[string]config.ModelConfig{
+			"model1": getTestSimpleResponderConfig("model1"),
+			"model2": getTestSimpleResponderConfig("model2"),
+		},
+		LogLevel: "error",
+		Groups: map[string]config.GroupConfig{
+			"heavy": {
+				Swap:      true,
+				Exclusive: true,
+				Members:   []string{"model1"},
+			},
+			"glm": {
+				Swap:      true,
+				Exclusive: false,
+				Members:   []string{"model2"},
+			},
+		},
+	})
+
+	proxy := New(cfg)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+
+	proxy.findGroupByModelName("model2").processes["model2"].forceState(StateReady)
+	assert.Equal(t, StateReady, proxy.findGroupByModelName("model2").processes["model2"].CurrentState())
+	assert.Equal(t, StateStopped, proxy.findGroupByModelName("model1").processes["model1"].CurrentState())
+
+	req := httptest.NewRequest("GET", "/upstream/model1/metrics", nil)
+	w := CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, StateStopped, proxy.findGroupByModelName("model1").processes["model1"].CurrentState())
+	assert.Equal(t, StateReady, proxy.findGroupByModelName("model2").processes["model2"].CurrentState())
+}
+
 func TestProxyManager_AudioTranscriptionHandler(t *testing.T) {
 	config := config.AddDefaultGroupToConfig(config.Config{
 		HealthCheckTimeout: 15,

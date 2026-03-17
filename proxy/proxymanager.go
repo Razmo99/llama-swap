@@ -634,6 +634,29 @@ func (pm *ProxyManager) proxyToUpstream(c *gin.Context) {
 		return
 	}
 
+	processGroup := pm.findGroupByModelName(modelID)
+	if processGroup == nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("process group not found for model %s", modelID))
+		return
+	}
+
+	if c.Request.Method == http.MethodGet && remainingPath == "/metrics" {
+		process, exists := processGroup.GetMember(modelID)
+		if !exists {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("process not found for model %s", modelID))
+			return
+		}
+		if process.CurrentState() != StateReady {
+			pm.sendErrorResponse(c, http.StatusServiceUnavailable, fmt.Sprintf("metrics unavailable for model %s", modelID))
+			return
+		}
+		if err := processGroup.ProxyRequest(modelID, c.Writer, c.Request); err != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
+			pm.proxyLogger.Errorf("Error proxying upstream metrics request for model %s, path=%s", modelID, c.Request.URL.Path)
+		}
+		return
+	}
+
 	processGroup, err := pm.swapProcessGroup(modelID)
 	if err != nil {
 		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
