@@ -40,15 +40,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./docker/build-container.sh ${{ matrix.platform }} ${{ github.event_name != 'push' }}
-
-  # note make sure this repository has admin rights to its llama-swap package
-  # see: https://github.com/actions/delete-package-versions/issues/74
-  delete-untagged-containers:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/delete-package-versions@v5
-        with:
-          package-name: 'llama-swap'
-          package-type: 'container'
-          delete-only-untagged-versions: 'true'
