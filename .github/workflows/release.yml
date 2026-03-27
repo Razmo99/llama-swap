@@ -48,6 +48,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   trigger-tap-update:
+    if: ${{ vars.RELEASE_DISPATCH_REPOSITORY != '' }}
     runs-on: ubuntu-latest
     needs: goreleaser
     steps:
@@ -61,11 +62,11 @@ jobs:
           fi
 
       - name: "Trigger tap repository update"
-        uses: peter-evans/repository-dispatch@v2
+        uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.TAP_REPO_PAT }}
-          repository: mostlygeek/homebrew-llama-swap
-          event-type: new-release
+          token: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
+          repository: ${{ vars.RELEASE_DISPATCH_REPOSITORY }}
+          event-type: ${{ vars.RELEASE_DISPATCH_EVENT_TYPE || 'new-release' }}
           client-payload: |
             {
               "release": {

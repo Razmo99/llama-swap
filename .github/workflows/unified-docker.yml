@@ -53,6 +53,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Resolve image settings
+        run: |
+          IMAGE_REPO="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_REPO=${IMAGE_REPO}" >> "${GITHUB_ENV}"
+          echo "DOCKER_IMAGE_TAG=ghcr.io/${IMAGE_REPO}:unified-${{ matrix.backend }}" >> "${GITHUB_ENV}"
+          echo "DOCKER_CACHE_REF=ghcr.io/${IMAGE_REPO}:unified-${{ matrix.backend }}-cache" >> "${GITHUB_ENV}"
+
       - name: Free up disk space
         run: |
           echo "Before cleanup:"
@@ -86,7 +93,9 @@ jobs:
           WHISPER_REF: ${{ inputs.whisper_ref || 'master' }}
           SD_REF: ${{ inputs.sd_ref || 'master' }}
           LS_VERSION: ${{ inputs.llama_swap_version || 'main' }}
-          DOCKER_IMAGE_TAG: ghcr.io/mostlygeek/llama-swap:unified-${{ matrix.backend }}
+          LLAMA_SWAP_REPO: https://github.com/${{ github.repository }}.git
+          DOCKER_IMAGE_TAG: ${{ env.DOCKER_IMAGE_TAG }}
+          DOCKER_CACHE_REF: ${{ env.DOCKER_CACHE_REF }}
           # When running under act, use the local builder that has warm ccache.
           # On GitHub Actions, BUILDX_BUILDER is unset so docker uses the builder
           # created by setup-buildx-action above.
@@ -98,7 +107,7 @@ jobs:
       - name: Push to GitHub Container Registry
         if: ${{ !env.ACT }}
         run: |
-          docker push ghcr.io/mostlygeek/llama-swap:unified-${{ matrix.backend }}
+          docker push "${DOCKER_IMAGE_TAG}"
           DATE_TAG=$(date -u +%Y-%m-%d)
-          docker tag ghcr.io/mostlygeek/llama-swap:unified-${{ matrix.backend }} ghcr.io/mostlygeek/llama-swap:unified-${{ matrix.backend }}-${DATE_TAG}
-          docker push ghcr.io/mostlygeek/llama-swap:unified-${{ matrix.backend }}-${DATE_TAG}
+          docker tag "${DOCKER_IMAGE_TAG}" "${DOCKER_IMAGE_TAG}-${DATE_TAG}"
+          docker push "${DOCKER_IMAGE_TAG}-${DATE_TAG}"
