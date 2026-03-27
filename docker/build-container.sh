@@ -195,7 +195,7 @@ for CONTAINER_TYPE in non-root root; do
   fi
 
   log_info "Building $CONTAINER_TYPE $CONTAINER_TAG $LS_VER"
-  docker build --provenance=false -f docker/llama-swap.Containerfile --build-arg BASE_TAG=${BASE_TAG} --build-arg UID=${USER_UID} \
+  docker build --provenance=false -f llama-swap.Containerfile --build-arg BASE_TAG=${BASE_TAG} --build-arg UID=${USER_UID} \
     --build-arg GID=${USER_GID} --build-arg USER_HOME=${USER_HOME} --build-arg INSTALL_PODMAN=${INSTALL_PODMAN} \
     --build-arg BASE_IMAGE=${BASE_IMAGE} --build-arg VERSION=local_${GIT_HASH} --build-arg COMMIT=${GIT_HASH} \
     --build-arg BUILD_DATE=${BUILD_DATE} -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} \
