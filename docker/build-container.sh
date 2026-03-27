@@ -69,6 +69,7 @@ if [[ -z "${LS_REPO}" ]]; then
   LS_REPO="Razmo99/llama-swap"
 fi
 LS_REPO_LOWER=$(echo "${LS_REPO}" | tr '[:upper:]' '[:lower:]')
+LS_DOWNLOAD_REPO=${LS_REPO}
 
 # the most recent llama-swap tag
 # have to strip out the 'v' due to .tar.gz file naming
@@ -84,7 +85,25 @@ case "${release_status}" in
     fi
     ;;
   404)
-    LS_VER="dev-$(git -C .. rev-parse --short HEAD)"
+    log_info "No releases found for ${LS_REPO}; falling back to upstream release artifacts."
+    upstream_response_file=$(mktemp)
+    upstream_status=$(curl -s -o "${upstream_response_file}" -w "%{http_code}" "https://api.github.com/repos/mostlygeek/llama-swap/releases/latest")
+    if [[ "${upstream_status}" != "200" ]]; then
+      log_info "Error: failed to resolve latest upstream release (HTTP ${upstream_status})."
+      if jq -e '.message' "${upstream_response_file}" >/dev/null 2>&1; then
+        log_info "GitHub API error: $(jq -r '.message' "${upstream_response_file}")"
+      fi
+      rm -f "${release_response_file}" "${upstream_response_file}"
+      exit 1
+    fi
+    LS_VER=$(jq -r '.tag_name // empty' "${upstream_response_file}" | sed 's/v//')
+    if [[ -z "${LS_VER}" ]]; then
+      log_info "Error: latest upstream release did not include tag_name."
+      rm -f "${release_response_file}" "${upstream_response_file}"
+      exit 1
+    fi
+    LS_DOWNLOAD_REPO="mostlygeek/llama-swap"
+    rm -f "${upstream_response_file}"
     ;;
   *)
     log_info "Error: failed to resolve latest release for ${LS_REPO} (HTTP ${release_status})."
@@ -181,7 +200,6 @@ for CONTAINER_TYPE in non-root root; do
   USER_UID=0
   USER_GID=0
   USER_HOME=/root
-  INSTALL_PODMAN=0
 
   if [ "$CONTAINER_TYPE" == "non-root" ]; then
     CONTAINER_TAG="${CONTAINER_TAG}-non-root"
@@ -189,17 +207,13 @@ for CONTAINER_TYPE in non-root root; do
     USER_UID=10001
     USER_GID=10001
     USER_HOME=/app
-    if [ "$ARCH" == "cpu" ]; then
-      INSTALL_PODMAN=1
-    fi
   fi
 
   log_info "Building $CONTAINER_TYPE $CONTAINER_TAG $LS_VER"
   docker build --provenance=false -f llama-swap.Containerfile --build-arg BASE_TAG=${BASE_TAG} --build-arg UID=${USER_UID} \
-    --build-arg GID=${USER_GID} --build-arg USER_HOME=${USER_HOME} --build-arg INSTALL_PODMAN=${INSTALL_PODMAN} \
-    --build-arg BASE_IMAGE=${BASE_IMAGE} --build-arg VERSION=local_${GIT_HASH} --build-arg COMMIT=${GIT_HASH} \
-    --build-arg BUILD_DATE=${BUILD_DATE} -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} \
-    ..
+    --build-arg LS_VER=${LS_VER} --build-arg LS_REPO=${LS_DOWNLOAD_REPO} --build-arg GID=${USER_GID} \
+    --build-arg USER_HOME=${USER_HOME} --build-arg BASE_IMAGE=${BASE_IMAGE} \
+    -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} .
 
   # For architectures with stable-diffusion.cpp support, layer sd-server on top
   case "$ARCH" in
