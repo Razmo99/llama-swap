@@ -5,8 +5,8 @@ on:
     paths:
       - "config-schema.json"
   push:
-    branches:
-      - main
+    tags-ignore:
+      - '*'
     paths:
       - "config-schema.json"
 

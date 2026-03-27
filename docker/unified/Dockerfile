@@ -82,8 +82,9 @@ RUN --mount=type=cache,id=ccache-${BACKEND},target=/ccache \
 
 FROM builder-base AS llama-swap-download
 ARG LS_VERSION=latest
+ARG LS_REPOSITORY
 COPY install-llama-swap.sh /build/
-RUN bash /build/install-llama-swap.sh "${LS_VERSION}"
+RUN LLAMA_SWAP_REPO_NAME="${LS_REPOSITORY}" bash /build/install-llama-swap.sh "${LS_VERSION}"
 
 # ── Runtime bases ─────────────────────────────────────────────────────
 

@@ -23,6 +23,22 @@ log_info() {
     echo "[INFO] $*"
 }
 
+resolve_repo_slug() {
+    if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
+        echo "${GITHUB_REPOSITORY}"
+        return
+    fi
+
+    local remote_url
+    remote_url=$(git -C .. remote get-url origin 2>/dev/null || true)
+    if [[ -z "${remote_url}" ]]; then
+        return
+    fi
+
+    echo "${remote_url}" \
+        | sed -E 's#^https://github.com/##; s#^git@github.com:##; s#\.git$##'
+}
+
 ARCH=$1
 PUSH_IMAGES=${2:-false}
 
@@ -46,13 +62,40 @@ fi
 BASE_IMAGE=${BASE_LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp}
 SD_IMAGE=${BASE_SDCPP_IMAGE:-ghcr.io/leejet/stable-diffusion.cpp}
 
-# Set llama-swap repository, automatically uses GITHUB_REPOSITORY variable
-# to enable easy container builds on forked repos
-LS_REPO=${GITHUB_REPOSITORY:-mostlygeek/llama-swap}
+# Set llama-swap repository from the current GitHub repository when available,
+# otherwise fall back to the local origin remote.
+LS_REPO=${LLAMA_SWAP_REPO_NAME:-$(resolve_repo_slug)}
+if [[ -z "${LS_REPO}" ]]; then
+  LS_REPO="Razmo99/llama-swap"
+fi
+LS_REPO_LOWER=$(echo "${LS_REPO}" | tr '[:upper:]' '[:lower:]')
 
 # the most recent llama-swap tag
 # have to strip out the 'v' due to .tar.gz file naming
-LS_VER=$(curl -s https://api.github.com/repos/${LS_REPO}/releases/latest | jq -r .tag_name | sed 's/v//')
+release_response_file=$(mktemp)
+release_status=$(curl -s -o "${release_response_file}" -w "%{http_code}" "https://api.github.com/repos/${LS_REPO}/releases/latest")
+case "${release_status}" in
+  200)
+    LS_VER=$(jq -r '.tag_name // empty' "${release_response_file}" | sed 's/v//')
+    if [[ -z "${LS_VER}" ]]; then
+      log_info "Error: latest release response for ${LS_REPO} did not include tag_name."
+      rm -f "${release_response_file}"
+      exit 1
+    fi
+    ;;
+  404)
+    LS_VER="dev-$(git -C .. rev-parse --short HEAD)"
+    ;;
+  *)
+    log_info "Error: failed to resolve latest release for ${LS_REPO} (HTTP ${release_status})."
+    if jq -e '.message' "${release_response_file}" >/dev/null 2>&1; then
+      log_info "GitHub API error: $(jq -r '.message' "${release_response_file}")"
+    fi
+    rm -f "${release_response_file}"
+    exit 1
+    ;;
+esac
+rm -f "${release_response_file}"
 
 # Fetches the most recent llama.cpp tag matching the given prefix
 # Handles pagination to search beyond the first 100 results
@@ -127,8 +170,8 @@ if [[ ! -z "$DEBUG_ABORT_BUILD" ]]; then
 fi
 
 for CONTAINER_TYPE in non-root root; do
-  CONTAINER_TAG="ghcr.io/${LS_REPO}:v${LS_VER}-${ARCH}-${LCPP_TAG}"
-  CONTAINER_LATEST="ghcr.io/${LS_REPO}:${ARCH}"
+  CONTAINER_TAG="ghcr.io/${LS_REPO_LOWER}:v${LS_VER}-${ARCH}-${LCPP_TAG}"
+  CONTAINER_LATEST="ghcr.io/${LS_REPO_LOWER}:${ARCH}"
   USER_UID=0
   USER_GID=0
   USER_HOME=/root

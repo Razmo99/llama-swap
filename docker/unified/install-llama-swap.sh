@@ -5,7 +5,12 @@
 set -e
 
 VERSION="${1:-latest}"
-REPO="mostlygeek/llama-swap"
+REPO="${LLAMA_SWAP_REPO_NAME:-}"
+
+if [ -z "${REPO}" ]; then
+    echo "FATAL: LLAMA_SWAP_REPO_NAME is not set" >&2
+    exit 1
+fi
 
 mkdir -p /install/bin
 

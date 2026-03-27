@@ -2,7 +2,8 @@ name: Linux CI
 
 on:
   push:
-    branches: [ "main" ]
+    tags-ignore:
+      - '*'
     # only run when backend source changes
     # cmd/ is excluded because it contains utilities without tests
     paths:
@@ -14,7 +15,6 @@ on:
       - '.github/workflows/go-ci.yml'
 
   pull_request:
-    branches: [ "main" ]
     paths:
       - '**/*.go'
       - '!cmd/**'

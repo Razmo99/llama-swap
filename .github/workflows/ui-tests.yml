@@ -2,13 +2,13 @@ name: UI Tests
 
 on:
   push:
-    branches: [ "main" ]
+    tags-ignore:
+      - '*'
     paths:
       - 'ui-svelte/**'
       - '.github/workflows/ui-tests.yml'
 
   pull_request:
-    branches: [ "main" ]
     paths:
       - 'ui-svelte/**'
       - '.github/workflows/ui-tests.yml'

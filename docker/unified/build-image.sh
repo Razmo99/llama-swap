@@ -17,6 +17,23 @@ set -euo pipefail
 
 BACKEND=""
 NO_CACHE=false
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+resolve_repo_slug() {
+    if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
+        echo "${GITHUB_REPOSITORY}"
+        return
+    fi
+
+    local remote_url
+    remote_url=$(git -C "${SCRIPT_DIR}/../.." remote get-url origin 2>/dev/null || true)
+    if [[ -z "${remote_url}" ]]; then
+        return
+    fi
+
+    echo "${remote_url}" \
+        | sed -E 's#^https://github.com/##; s#^git@github.com:##; s#\.git$##'
+}
 
 for arg in "$@"; do
     case $arg in
@@ -57,12 +74,19 @@ if [[ -z "$BACKEND" ]]; then
 fi
 
 DOCKER_IMAGE_TAG="${DOCKER_IMAGE_TAG:-llama-swap:unified-${BACKEND}}"
+LLAMA_SWAP_REPO_NAME="${LLAMA_SWAP_REPO_NAME:-$(resolve_repo_slug)}"
+LLAMA_SWAP_REPO_NAME="${LLAMA_SWAP_REPO_NAME:-Razmo99/llama-swap}"
+LLAMA_SWAP_REPO_NAME_LOWER=$(echo "${LLAMA_SWAP_REPO_NAME}" | tr '[:upper:]' '[:lower:]')
 
 # Git repository URLs
 LLAMA_REPO="https://github.com/ggml-org/llama.cpp.git"
 WHISPER_REPO="https://github.com/ggml-org/whisper.cpp.git"
 SD_REPO="https://github.com/leejet/stable-diffusion.cpp.git"
-LLAMA_SWAP_REPO="https://github.com/mostlygeek/llama-swap.git"
+if [[ -n "${LLAMA_SWAP_REPO_NAME}" ]]; then
+    LLAMA_SWAP_REPO="${LLAMA_SWAP_REPO:-https://github.com/${LLAMA_SWAP_REPO_NAME}.git}"
+else
+    LLAMA_SWAP_REPO="${LLAMA_SWAP_REPO:-}"
+fi
 
 # Resolve a git ref (commit hash, tag, or branch) to a full commit hash.
 # Requires only: git, network access to the remote.
@@ -171,14 +195,13 @@ echo "Starting Docker build..."
 echo "=========================================="
 echo ""
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 BUILD_ARGS=(
     --build-arg "BACKEND=${BACKEND}"
     --build-arg "LLAMA_COMMIT_HASH=${LLAMA_HASH}"
     --build-arg "WHISPER_COMMIT_HASH=${WHISPER_HASH}"
     --build-arg "SD_COMMIT_HASH=${SD_HASH}"
     --build-arg "LS_VERSION=${LS_HASH}"
+    --build-arg "LS_REPOSITORY=${LLAMA_SWAP_REPO_NAME}"
     -t "${DOCKER_IMAGE_TAG}"
     -f "${SCRIPT_DIR}/Dockerfile"
 )
@@ -187,7 +210,7 @@ if [[ "$NO_CACHE" == true ]]; then
     BUILD_ARGS+=(--no-cache)
     echo "Note: Building without cache"
 elif [[ "${GITHUB_ACTIONS:-}" == "true" && "${ACT:-}" != "true" ]]; then
-    CACHE_REF="ghcr.io/mostlygeek/llama-swap:unified-${BACKEND}-cache"
+    CACHE_REF="${DOCKER_CACHE_REF:-ghcr.io/${LLAMA_SWAP_REPO_NAME_LOWER}:unified-${BACKEND}-cache}"
     BUILD_ARGS+=(
         --cache-from "type=registry,ref=${CACHE_REF}"
         --cache-to "type=registry,ref=${CACHE_REF},mode=max"
