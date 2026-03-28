@@ -4,8 +4,11 @@ on:
   # Allows manual triggering of the workflow
   workflow_dispatch:
 
-  # Run on workflow file changes (without pushing)
+  # Publish CPU images from the main development branches
   push:
+    branches:
+      - main
+      - develop
     paths:
       - '.github/workflows/containers.yml'
       - 'docker/build-container.sh'
@@ -39,4 +42,4 @@ jobs:
       - name: Run build-container
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./docker/build-container.sh ${{ matrix.platform }} ${{ github.event_name != 'push' }}
+        run: ./docker/build-container.sh ${{ matrix.platform }} true
