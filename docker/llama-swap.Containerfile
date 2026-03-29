@@ -51,7 +51,7 @@ RUN \
     rm "llama-swap_${LS_VER}_linux_amd64.tar.gz"
 
 COPY --from=compose-config-gen-builder /out/compose-config-gen /app/compose-config-gen
-COPY --chown=$UID:$GID config.example.yaml /app/config.yaml
+COPY --chown=$UID:$GID docker/config.example.yaml /app/config.yaml
 
 # Switch user
 USER $UID:$GID

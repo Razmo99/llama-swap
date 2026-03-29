@@ -234,7 +234,7 @@ for CONTAINER_TYPE in non-root root; do
   docker build --platform ${BUILD_PLATFORM} --provenance=false -f llama-swap.Containerfile --build-arg BASE_TAG=${BASE_TAG} --build-arg UID=${USER_UID} \
     --build-arg LS_VER=${LS_VER} --build-arg LS_REPO=${LS_DOWNLOAD_REPO} --build-arg GID=${USER_GID} \
     --build-arg USER_HOME=${USER_HOME} --build-arg BASE_IMAGE=${BASE_IMAGE} \
-    -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} .
+    -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} ..
 
   # For architectures with stable-diffusion.cpp support, layer sd-server on top
   case "$ARCH" in
