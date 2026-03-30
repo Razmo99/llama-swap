@@ -9,13 +9,32 @@ RUN go mod download
 COPY cmd/compose-config-gen ./cmd/compose-config-gen
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/compose-config-gen ./cmd/compose-config-gen
 
+FROM golang:1.26.1-bookworm AS llama-swap-builder
+
+ARG GIT_HASH=unknown
+ARG BUILD_DATE=unknown
+ARG LS_VER=dev
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY event ./event
+COPY proxy ./proxy
+COPY llama-swap.go ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags "-s -w -X main.version=${LS_VER} -X main.commit=${GIT_HASH} -X main.date=${BUILD_DATE}" \
+    -o /out/llama-swap .
+
 ARG BASE_IMAGE
 ARG BASE_TAG
 FROM ${BASE_IMAGE}:${BASE_TAG}
 
 # has to be after the FROM
-ARG LS_VER=170
+ARG LS_VER=dev
 ARG LS_REPO=mostlygeek/llama-swap
+ARG GIT_HASH=unknown
+ARG BUILD_DATE=unknown
 
 # Set default UID/GID arguments
 ARG UID=10001
@@ -45,13 +64,14 @@ RUN curl -L -o /usr/local/bin/docker-compose \
       https://github.com/docker/compose/releases/download/v2.35.1/docker-compose-linux-x86_64 \
       && chmod +x /usr/local/bin/docker-compose
 
-RUN \
-    curl -LO "https://github.com/${LS_REPO}/releases/download/v${LS_VER}/llama-swap_${LS_VER}_linux_amd64.tar.gz" && \
-    tar -zxf "llama-swap_${LS_VER}_linux_amd64.tar.gz" && \
-    rm "llama-swap_${LS_VER}_linux_amd64.tar.gz"
-
 COPY --from=compose-config-gen-builder /out/compose-config-gen /app/compose-config-gen
+COPY --from=llama-swap-builder /out/llama-swap /app/llama-swap
 COPY --chown=$UID:$GID docker/config.example.yaml /app/config.yaml
+
+LABEL org.opencontainers.image.source="https://github.com/${LS_REPO}" \
+      org.opencontainers.image.revision="${GIT_HASH}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.version="${LS_VER}"
 
 # Switch user
 USER $UID:$GID

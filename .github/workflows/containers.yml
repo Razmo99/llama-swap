@@ -13,6 +13,12 @@ on:
       - '.github/workflows/containers.yml'
       - 'docker/build-container.sh'
       - 'docker/*.Containerfile'
+      - 'cmd/**/*.go'
+      - 'event/**/*.go'
+      - 'proxy/**/*.go'
+      - 'llama-swap.go'
+      - 'go.mod'
+      - 'go.sum'
       - 'docker/config.example.yaml'
 
 # grant permissions on GITHUB_TOKEN to publish packages

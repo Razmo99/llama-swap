@@ -70,52 +70,14 @@ if [[ -z "${LS_REPO}" ]]; then
   LS_REPO="Razmo99/llama-swap"
 fi
 LS_REPO_LOWER=$(echo "${LS_REPO}" | tr '[:upper:]' '[:lower:]')
-LS_DOWNLOAD_REPO=${LS_REPO}
 
-# the most recent llama-swap tag
-# have to strip out the 'v' due to .tar.gz file naming
-release_response_file=$(mktemp)
-release_status=$(curl -s -o "${release_response_file}" -w "%{http_code}" "https://api.github.com/repos/${LS_REPO}/releases/latest")
-case "${release_status}" in
-  200)
-    LS_VER=$(jq -r '.tag_name // empty' "${release_response_file}" | sed 's/v//')
-    if [[ -z "${LS_VER}" ]]; then
-      log_info "Error: latest release response for ${LS_REPO} did not include tag_name."
-      rm -f "${release_response_file}"
-      exit 1
-    fi
-    ;;
-  404)
-    log_info "No releases found for ${LS_REPO}; falling back to upstream release artifacts."
-    upstream_response_file=$(mktemp)
-    upstream_status=$(curl -s -o "${upstream_response_file}" -w "%{http_code}" "https://api.github.com/repos/mostlygeek/llama-swap/releases/latest")
-    if [[ "${upstream_status}" != "200" ]]; then
-      log_info "Error: failed to resolve latest upstream release (HTTP ${upstream_status})."
-      if jq -e '.message' "${upstream_response_file}" >/dev/null 2>&1; then
-        log_info "GitHub API error: $(jq -r '.message' "${upstream_response_file}")"
-      fi
-      rm -f "${release_response_file}" "${upstream_response_file}"
-      exit 1
-    fi
-    LS_VER=$(jq -r '.tag_name // empty' "${upstream_response_file}" | sed 's/v//')
-    if [[ -z "${LS_VER}" ]]; then
-      log_info "Error: latest upstream release did not include tag_name."
-      rm -f "${release_response_file}" "${upstream_response_file}"
-      exit 1
-    fi
-    LS_DOWNLOAD_REPO="mostlygeek/llama-swap"
-    rm -f "${upstream_response_file}"
-    ;;
-  *)
-    log_info "Error: failed to resolve latest release for ${LS_REPO} (HTTP ${release_status})."
-    if jq -e '.message' "${release_response_file}" >/dev/null 2>&1; then
-      log_info "GitHub API error: $(jq -r '.message' "${release_response_file}")"
-    fi
-    rm -f "${release_response_file}"
-    exit 1
-    ;;
-esac
-rm -f "${release_response_file}"
+# Derive a source version from the checkout being built rather than downloading
+# the latest GitHub release artifact, which can lag the current branch.
+if git -C .. describe --tags --abbrev=0 >/dev/null 2>&1; then
+  LS_VER=$(git -C .. describe --tags --abbrev=0 | sed 's/^v//')
+else
+  LS_VER="0.0.0"
+fi
 
 # Fetches the most recent llama.cpp tag matching the given regex.
 # Optionally filters tags by manifest architecture.
@@ -230,9 +192,9 @@ for CONTAINER_TYPE in non-root root; do
     USER_HOME=/app
   fi
 
-  log_info "Building $CONTAINER_TYPE $CONTAINER_TAG $LS_VER"
+  log_info "Building $CONTAINER_TYPE $CONTAINER_TAG from source ${GIT_HASH}"
   docker build --platform ${BUILD_PLATFORM} --provenance=false -f llama-swap.Containerfile --build-arg BASE_TAG=${BASE_TAG} --build-arg UID=${USER_UID} \
-    --build-arg LS_VER=${LS_VER} --build-arg LS_REPO=${LS_DOWNLOAD_REPO} --build-arg GID=${USER_GID} \
+    --build-arg LS_VER=${LS_VER} --build-arg LS_REPO=${LS_REPO} --build-arg GIT_HASH=${GIT_HASH} --build-arg BUILD_DATE=${BUILD_DATE} --build-arg GID=${USER_GID} \
     --build-arg USER_HOME=${USER_HOME} --build-arg BASE_IMAGE=${BASE_IMAGE} \
     -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} ..
 
