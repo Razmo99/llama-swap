@@ -9,7 +9,7 @@ RUN go mod download
 COPY cmd/compose-config-gen ./cmd/compose-config-gen
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/compose-config-gen ./cmd/compose-config-gen
 
-FROM node:22-bookworm-slim AS ui-builder
+FROM node:25-bookworm-slim AS ui-builder
 
 WORKDIR /src/ui-svelte
 COPY ui-svelte/package.json ui-svelte/package-lock.json ./
