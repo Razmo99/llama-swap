@@ -13,7 +13,7 @@ FROM node:25-bookworm-slim AS ui-builder
 
 WORKDIR /src/ui-svelte
 COPY ui-svelte/package.json ui-svelte/package-lock.json ./
-RUN npm ci
+RUN npm ci --legacy-peer-deps
 COPY ui-svelte ./
 RUN mkdir -p /src/proxy && npm run build
 
