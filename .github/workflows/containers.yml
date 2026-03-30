@@ -16,6 +16,7 @@ on:
       - 'cmd/**/*.go'
       - 'event/**/*.go'
       - 'proxy/**/*.go'
+      - 'ui-svelte/**'
       - 'llama-swap.go'
       - 'go.mod'
       - 'go.sum'

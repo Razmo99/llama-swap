@@ -9,6 +9,14 @@ RUN go mod download
 COPY cmd/compose-config-gen ./cmd/compose-config-gen
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/compose-config-gen ./cmd/compose-config-gen
 
+FROM node:22-bookworm-slim AS ui-builder
+
+WORKDIR /src/ui-svelte
+COPY ui-svelte/package.json ui-svelte/package-lock.json ./
+RUN npm ci
+COPY ui-svelte ./
+RUN mkdir -p /src/proxy && npm run build
+
 FROM golang:1.26.1-bookworm AS llama-swap-builder
 
 ARG GIT_HASH=unknown
@@ -22,10 +30,7 @@ COPY cmd ./cmd
 COPY event ./event
 COPY proxy ./proxy
 COPY llama-swap.go ./
-RUN mkdir -p proxy/ui_dist && \
-    if [ ! -f proxy/ui_dist/index.html ]; then \
-      printf '%s\n' '<!doctype html><html><body>llama-swap UI assets not bundled in this image.</body></html>' > proxy/ui_dist/index.html; \
-    fi
+COPY --from=ui-builder /src/proxy/ui_dist ./proxy/ui_dist
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags "-s -w -X main.version=${LS_VER} -X main.commit=${GIT_HASH} -X main.date=${BUILD_DATE}" \
     -o /out/llama-swap .
