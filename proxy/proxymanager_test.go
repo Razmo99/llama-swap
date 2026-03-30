@@ -839,6 +839,39 @@ func TestProxyManager_StoppedMetricsEndpointDoesNotEvictRunningModel(t *testing.
 	assert.Equal(t, StateReady, proxy.findGroupByModelName("model2").processes["model2"].CurrentState())
 }
 
+func TestProxyManager_ReadyMetricsEndpointRewritesPathBeforeProxy(t *testing.T) {
+	var receivedPath string
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer testServer.Close()
+
+	cfg := config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		Models: map[string]config.ModelConfig{
+			"model1": {
+				Proxy:         testServer.URL,
+				CheckEndpoint: "/health",
+			},
+		},
+		LogLevel: "error",
+	})
+
+	proxy := New(cfg)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+
+	proxy.findGroupByModelName("model1").processes["model1"].forceState(StateReady)
+
+	req := httptest.NewRequest("GET", "/upstream/model1/metrics", nil)
+	w := CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "/metrics", receivedPath)
+}
+
 func TestProxyManager_AudioTranscriptionHandler(t *testing.T) {
 	config := config.AddDefaultGroupToConfig(config.Config{
 		HealthCheckTimeout: 15,

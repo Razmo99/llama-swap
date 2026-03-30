@@ -655,9 +655,11 @@ func (pm *ProxyManager) proxyToUpstream(c *gin.Context) {
 			pm.sendErrorResponse(c, http.StatusServiceUnavailable, fmt.Sprintf("metrics unavailable for model %s", modelID))
 			return
 		}
+		originalPath := c.Request.URL.Path
+		c.Request.URL.Path = remainingPath
 		if err := processGroup.ProxyRequest(modelID, c.Writer, c.Request); err != nil {
 			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
-			pm.proxyLogger.Errorf("Error proxying upstream metrics request for model %s, path=%s", modelID, c.Request.URL.Path)
+			pm.proxyLogger.Errorf("Error proxying upstream metrics request for model %s, path=%s", modelID, originalPath)
 		}
 		return
 	}
