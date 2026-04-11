@@ -1,10 +1,16 @@
 name: Build Containers
 
 on:
+  # time has no specific meaning, trying to time it after
+  # the llama.cpp daily packages are published
+  # https://github.com/ggml-org/llama.cpp/blob/master/.github/workflows/docker.yml
+  schedule:
+    - cron: "37 5 * * *"
+
   # Allows manual triggering of the workflow
   workflow_dispatch:
 
-  # Publish CPU images from the main development branches
+  # Publish images from the main development branches
   push:
     branches:
       - main
@@ -33,9 +39,9 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         platform: [cpu]
-      fail-fast: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
