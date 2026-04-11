@@ -18,10 +18,6 @@ on:
         description: "stable-diffusion.cpp commit hash, tag, or branch"
         required: false
         default: "master"
-      ik_llama_ref:
-        description: "ik_llama.cpp commit hash, tag, or branch (CUDA only)"
-        required: false
-        default: "main"
       llama_swap_version:
         description: "llama-swap version (e.g. v198, latest, main)"
         required: false
@@ -48,9 +44,9 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - id: set-matrix
-        shell: bash
         run: |
           backends=()
+          # schedule uses defaults (build both); workflow_dispatch respects inputs
           if [[ "${{ github.event_name }}" == "schedule" ]] || [[ "${{ inputs.build_cuda }}" == "true" ]]; then
             backends+=("cuda")
           fi
@@ -58,7 +54,7 @@ jobs:
             backends+=("vulkan")
           fi
           matrix=$(printf '%s\n' "${backends[@]}" | jq -R . | jq -sc .)
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
 
   build:
     needs: setup
@@ -72,6 +68,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Resolve image settings
+        run: |
+          IMAGE_REPO="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_REPO=${IMAGE_REPO}" >> "${GITHUB_ENV}"
+          echo "DOCKER_IMAGE_TAG=ghcr.io/${IMAGE_REPO}:unified-${{ matrix.backend }}" >> "${GITHUB_ENV}"
+          echo "DOCKER_CACHE_REF=ghcr.io/${IMAGE_REPO}:unified-${{ matrix.backend }}-cache" >> "${GITHUB_ENV}"
+
       - name: Free up disk space
         run: |
           echo "Before cleanup:"
@@ -84,6 +87,9 @@ jobs:
           echo "After cleanup:"
           df -h
 
+      # On GitHub Actions runners, create a fresh builder.
+      # When running locally under act, skip this and reuse the existing
+      # llama-swap-builder (which has ccache warm) to avoid exhausting disk.
       - name: Set up Docker Buildx
         if: ${{ !env.ACT }}
         uses: docker/setup-buildx-action@v3
@@ -96,22 +102,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve fork-safe image namespace
-        id: image
-        shell: bash
-        run: |
-          repo_lower=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
-          echo "repo_lower=${repo_lower}" >> "$GITHUB_OUTPUT"
-
       - name: Build unified Docker image (${{ matrix.backend }})
         env:
           LLAMA_REF: ${{ inputs.llama_cpp_ref || 'master' }}
           WHISPER_REF: ${{ inputs.whisper_ref || 'master' }}
           SD_REF: ${{ inputs.sd_ref || 'master' }}
-          IK_LLAMA_REF: ${{ inputs.ik_llama_ref || 'main' }}
           LS_VERSION: ${{ inputs.llama_swap_version || 'main' }}
-          LLAMA_SWAP_REPO_NAME: ${{ github.repository }}
-          DOCKER_IMAGE_TAG: ghcr.io/${{ steps.image.outputs.repo_lower }}:unified-${{ matrix.backend }}
+          LLAMA_SWAP_REPO: https://github.com/${{ github.repository }}.git
+          DOCKER_IMAGE_TAG: ${{ env.DOCKER_IMAGE_TAG }}
+          DOCKER_CACHE_REF: ${{ env.DOCKER_CACHE_REF }}
+          # When running under act, use the local builder that has warm ccache.
+          # On GitHub Actions, BUILDX_BUILDER is unset so docker uses the builder
+          # created by setup-buildx-action above.
           BUILDX_BUILDER: ${{ env.ACT == 'true' && 'llama-swap-builder' || '' }}
         run: |
           chmod +x docker/unified/build-image.sh
@@ -119,16 +121,8 @@ jobs:
 
       - name: Push to GitHub Container Registry
         if: ${{ !env.ACT }}
-        env:
-          BASE_TAG: ghcr.io/${{ steps.image.outputs.repo_lower }}:unified-${{ matrix.backend }}
         run: |
+          docker push "${DOCKER_IMAGE_TAG}"
           DATE_TAG=$(date -u +%Y-%m-%d)
-
-          docker push "${BASE_TAG}"
-          docker tag "${BASE_TAG}" "${BASE_TAG}-${DATE_TAG}"
-          docker push "${BASE_TAG}-${DATE_TAG}"
-
-          ROOTLESS_TAG="${BASE_TAG}-rootless"
-          docker push "${ROOTLESS_TAG}"
-          docker tag "${ROOTLESS_TAG}" "${ROOTLESS_TAG}-${DATE_TAG}"
-          docker push "${ROOTLESS_TAG}-${DATE_TAG}"
+          docker tag "${DOCKER_IMAGE_TAG}" "${DOCKER_IMAGE_TAG}-${DATE_TAG}"
+          docker push "${DOCKER_IMAGE_TAG}-${DATE_TAG}"

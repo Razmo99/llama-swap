@@ -61,7 +61,6 @@ fi
 # variable, this permits testing with forked llama.cpp repositories
 BASE_IMAGE=${BASE_LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp}
 SD_IMAGE=${BASE_SDCPP_IMAGE:-ghcr.io/leejet/stable-diffusion.cpp}
-BUILD_PLATFORM=${BUILD_PLATFORM:-linux/amd64}
 
 # Set llama-swap repository from the current GitHub repository when available,
 # otherwise fall back to the local origin remote.
@@ -71,24 +70,39 @@ if [[ -z "${LS_REPO}" ]]; then
 fi
 LS_REPO_LOWER=$(echo "${LS_REPO}" | tr '[:upper:]' '[:lower:]')
 
-# Derive a source version from the checkout being built rather than downloading
-# the latest GitHub release artifact, which can lag the current branch.
-if git -C .. describe --tags --abbrev=0 >/dev/null 2>&1; then
-  LS_VER=$(git -C .. describe --tags --abbrev=0 | sed 's/^v//')
-else
-  LS_VER="0.0.0"
-fi
+# the most recent llama-swap tag
+# have to strip out the 'v' due to .tar.gz file naming
+release_response_file=$(mktemp)
+release_status=$(curl -s -o "${release_response_file}" -w "%{http_code}" "https://api.github.com/repos/${LS_REPO}/releases/latest")
+case "${release_status}" in
+  200)
+    LS_VER=$(jq -r '.tag_name // empty' "${release_response_file}" | sed 's/v//')
+    if [[ -z "${LS_VER}" ]]; then
+      log_info "Error: latest release response for ${LS_REPO} did not include tag_name."
+      rm -f "${release_response_file}"
+      exit 1
+    fi
+    ;;
+  404)
+    LS_VER="dev-$(git -C .. rev-parse --short HEAD)"
+    ;;
+  *)
+    log_info "Error: failed to resolve latest release for ${LS_REPO} (HTTP ${release_status})."
+    if jq -e '.message' "${release_response_file}" >/dev/null 2>&1; then
+      log_info "GitHub API error: $(jq -r '.message' "${release_response_file}")"
+    fi
+    rm -f "${release_response_file}"
+    exit 1
+    ;;
+esac
+rm -f "${release_response_file}"
 
-# Fetches the most recent llama.cpp tag matching the given regex.
-# Optionally filters tags by manifest architecture.
+# Fetches the most recent llama.cpp tag matching the given prefix
+# Handles pagination to search beyond the first 100 results
 # $1 - tag_prefix (e.g., "server" or "server-vulkan")
-# $2 - tag_regex (e.g., "^server-b[0-9]+$")
-# $3 - required_arch (optional, e.g., "amd64")
 # Returns: the version number extracted from the tag
 fetch_llama_tag() {
     local tag_prefix=$1
-    local tag_regex=$2
-    local required_arch=${3:-}
     local page=1
     local per_page=100
 
@@ -111,32 +125,16 @@ fetch_llama_tag() {
             return 1
         fi
 
-        while IFS= read -r found_tag; do
-            [[ -z "$found_tag" ]] && continue
+        # Extract matching tag from this page
+        local found_tag=$(echo "$response" | jq -r \
+            ".[] | select(.metadata.container.tags[]? | startswith(\"$tag_prefix\")) | .metadata.container.tags[] | select(startswith(\"$tag_prefix\"))" \
+            | sort -r | head -n1)
 
-            if [[ -n "$required_arch" ]]; then
-                local manifest
-                manifest=$(docker manifest inspect --verbose "${BASE_IMAGE}:${found_tag}" 2>/dev/null || true)
-                local manifest_arch
-                local manifest_os
-                manifest_arch=$(echo "$manifest" | jq -r '.Descriptor.platform.architecture // empty' 2>/dev/null || true)
-                manifest_os=$(echo "$manifest" | jq -r '.Descriptor.platform.os // empty' 2>/dev/null || true)
-
-                if [[ "$manifest_arch" != "$required_arch" || "$manifest_os" != "linux" ]]; then
-                    log_debug "Skipping tag $found_tag with platform ${manifest_os:-unknown}/${manifest_arch:-unknown}"
-                    continue
-                fi
-            fi
-
+        if [ -n "$found_tag" ]; then
             log_debug "Found tag: $found_tag on page $page"
             echo "$found_tag" | awk -F '-' '{print $NF}'
             return 0
-        done < <(
-            echo "$response" \
-                | jq -r '.[] | .metadata.container.tags[]?' \
-                | grep -E "$tag_regex" \
-                | sort -Vr
-        )
+        fi
 
         page=$((page + 1))
 
@@ -149,10 +147,10 @@ fetch_llama_tag() {
 }
 
 if [ "$ARCH" == "cpu" ]; then
-    LCPP_TAG=$(fetch_llama_tag "server" '^server-b[0-9]+$' "amd64")
+    LCPP_TAG=$(fetch_llama_tag "server")
     BASE_TAG=server-${LCPP_TAG}
 else
-    LCPP_TAG=$(fetch_llama_tag "server-${ARCH}" "^server-${ARCH}-b[0-9]+$")
+    LCPP_TAG=$(fetch_llama_tag "server-${ARCH}")
     BASE_TAG=server-${ARCH}-${LCPP_TAG}
 fi
 
@@ -171,12 +169,6 @@ if [[ ! -z "$DEBUG_ABORT_BUILD" ]]; then
     exit 0
 fi
 
-GIT_HASH=$(git -C .. rev-parse --short HEAD)
-if [[ -n "$(git -C .. status --porcelain)" ]]; then
-  GIT_HASH="${GIT_HASH}+"
-fi
-BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
 for CONTAINER_TYPE in non-root root; do
   CONTAINER_TAG="ghcr.io/${LS_REPO_LOWER}:v${LS_VER}-${ARCH}-${LCPP_TAG}"
   CONTAINER_LATEST="ghcr.io/${LS_REPO_LOWER}:${ARCH}"
@@ -192,17 +184,16 @@ for CONTAINER_TYPE in non-root root; do
     USER_HOME=/app
   fi
 
-  log_info "Building $CONTAINER_TYPE $CONTAINER_TAG from source ${GIT_HASH}"
-  docker build --platform ${BUILD_PLATFORM} --provenance=false -f llama-swap.Containerfile --build-arg BASE_TAG=${BASE_TAG} --build-arg UID=${USER_UID} \
-    --build-arg LS_VER=${LS_VER} --build-arg LS_REPO=${LS_REPO} --build-arg GIT_HASH=${GIT_HASH} --build-arg BUILD_DATE=${BUILD_DATE} --build-arg GID=${USER_GID} \
-    --build-arg USER_HOME=${USER_HOME} --build-arg BASE_IMAGE=${BASE_IMAGE} \
-    -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} ..
+  log_info "Building $CONTAINER_TYPE $CONTAINER_TAG $LS_VER"
+  docker build --provenance=false -f llama-swap.Containerfile --build-arg BASE_TAG=${BASE_TAG} --build-arg LS_VER=${LS_VER} --build-arg UID=${USER_UID} \
+    --build-arg LS_REPO=${LS_REPO} --build-arg GID=${USER_GID} --build-arg USER_HOME=${USER_HOME} -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} \
+    --build-arg BASE_IMAGE=${BASE_IMAGE} .
 
   # For architectures with stable-diffusion.cpp support, layer sd-server on top
   case "$ARCH" in
     "musa" | "vulkan")
       log_info "Adding sd-server to $CONTAINER_TAG"
-      docker build --platform ${BUILD_PLATFORM} --provenance=false -f llama-swap-sd.Containerfile \
+      docker build --provenance=false -f llama-swap-sd.Containerfile \
         --build-arg BASE=${CONTAINER_TAG} \
         --build-arg SD_IMAGE=${SD_IMAGE} --build-arg SD_TAG=${SD_TAG} \
         --build-arg UID=${USER_UID} --build-arg GID=${USER_GID} \
