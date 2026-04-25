@@ -10,12 +10,22 @@ on:
   # Allows manual triggering of the workflow
   workflow_dispatch:
 
-  # Run on workflow file changes (without pushing)
+  # Publish images from main on workflow, dockerfile, or source changes
   push:
+    branches:
+      - main
     paths:
       - '.github/workflows/containers.yml'
       - 'docker/build-container.sh'
       - 'docker/*.Containerfile'
+      - 'docker/config.example.yaml'
+      - 'cmd/**/*.go'
+      - 'event/**/*.go'
+      - 'proxy/**/*.go'
+      - 'ui-svelte/**'
+      - 'llama-swap.go'
+      - 'go.mod'
+      - 'go.sum'
 
 # grant permissions on GITHUB_TOKEN to publish packages
 # ref: https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions#publishing-a-package-using-an-action
@@ -58,7 +68,7 @@ jobs:
       - name: Run build-container
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./docker/build-container.sh ${{ matrix.platform }} ${{ github.event_name != 'push' }}
+        run: ./docker/build-container.sh ${{ matrix.platform }} true
 
   # note make sure this repository has admin rights to its llama-swap package
   # see: https://github.com/actions/delete-package-versions/issues/74
