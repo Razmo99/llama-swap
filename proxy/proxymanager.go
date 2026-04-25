@@ -668,6 +668,32 @@ func (pm *ProxyManager) proxyToUpstream(c *gin.Context) {
 		return
 	}
 
+	// metrics-no-swap: GET /metrics must not trigger a model swap. Only applies
+	// in non-matrix mode; matrix mode performs its own swap accounting.
+	if pm.matrix == nil && c.Request.Method == http.MethodGet && remainingPath == "/metrics" {
+		processGroup := pm.findGroupByModelName(modelID)
+		if processGroup == nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("process group not found for model %s", modelID))
+			return
+		}
+		process, exists := processGroup.GetMember(modelID)
+		if !exists {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("process not found for model %s", modelID))
+			return
+		}
+		if process.CurrentState() != StateReady {
+			pm.sendErrorResponse(c, http.StatusServiceUnavailable, fmt.Sprintf("metrics unavailable for model %s", modelID))
+			return
+		}
+		originalPath := c.Request.URL.Path
+		c.Request.URL.Path = remainingPath
+		if err := processGroup.ProxyRequest(modelID, c.Writer, c.Request); err != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
+			pm.proxyLogger.Errorf("Error proxying upstream metrics request for model %s, path=%s", modelID, originalPath)
+		}
+		return
+	}
+
 	var handler func(string, http.ResponseWriter, *http.Request) error
 	if pm.matrix != nil {
 		handler = pm.matrix.ProxyRequest
