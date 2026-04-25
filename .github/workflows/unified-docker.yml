@@ -18,6 +18,10 @@ on:
         description: "stable-diffusion.cpp commit hash, tag, or branch"
         required: false
         default: "master"
+      ik_llama_ref:
+        description: "ik_llama.cpp commit hash, tag, or branch (CUDA only)"
+        required: false
+        default: "main"
       llama_swap_version:
         description: "llama-swap version (e.g. v198, latest, main)"
         required: false
@@ -29,6 +33,11 @@ on:
         default: true
       build_vulkan:
         description: "Build Vulkan image"
+        type: boolean
+        required: false
+        default: true
+      push_to_ghcr:
+        description: "Push images to ghcr.io"
         type: boolean
         required: false
         default: true
@@ -107,6 +116,7 @@ jobs:
           LLAMA_REF: ${{ inputs.llama_cpp_ref || 'master' }}
           WHISPER_REF: ${{ inputs.whisper_ref || 'master' }}
           SD_REF: ${{ inputs.sd_ref || 'master' }}
+          IK_LLAMA_REF: ${{ inputs.ik_llama_ref || 'main' }}
           LS_VERSION: ${{ inputs.llama_swap_version || 'main' }}
           LLAMA_SWAP_REPO: https://github.com/${{ github.repository }}.git
           DOCKER_IMAGE_TAG: ${{ env.DOCKER_IMAGE_TAG }}
@@ -120,9 +130,15 @@ jobs:
           docker/unified/build-image.sh --${{ matrix.backend }}
 
       - name: Push to GitHub Container Registry
-        if: ${{ !env.ACT }}
+        if: ${{ !env.ACT && (github.event_name == 'schedule' || inputs.push_to_ghcr == true) }}
         run: |
-          docker push "${DOCKER_IMAGE_TAG}"
           DATE_TAG=$(date -u +%Y-%m-%d)
+
+          docker push "${DOCKER_IMAGE_TAG}"
           docker tag "${DOCKER_IMAGE_TAG}" "${DOCKER_IMAGE_TAG}-${DATE_TAG}"
           docker push "${DOCKER_IMAGE_TAG}-${DATE_TAG}"
+
+          ROOTLESS_TAG="${DOCKER_IMAGE_TAG}-rootless"
+          docker push "${ROOTLESS_TAG}"
+          docker tag "${ROOTLESS_TAG}" "${ROOTLESS_TAG}-${DATE_TAG}"
+          docker push "${ROOTLESS_TAG}-${DATE_TAG}"

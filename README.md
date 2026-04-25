@@ -5,7 +5,7 @@
 
 # llama-swap
 
-Run multiple generative AI models on your machine and hot-swap between them on demand. llama-swap works with any OpenAI and Anthropic API compatible server and is used by thousands of people to power their local AI workflows. 
+Run multiple generative AI models on your machine and hot-swap between them on demand. llama-swap works with any OpenAI and Anthropic API compatible server and is used by thousands of people to power their local AI workflows.
 
 Built in Go for performance and simplicity, llama-swap has zero dependencies and is incredibly easy to set up. Get started in minutes - just one binary and one configuration file.
 
@@ -32,6 +32,10 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
   - `v1/rerank`, `v1/reranking`, `/rerank`
   - `/infill` - for code infilling
   - `/completion` - for completion endpoint
+- ✅ SDAPI via [stable-diffusion.cpp's server](https://github.com/leejet/stable-diffusion.cpp/tree/master/examples/server)
+  - `/sdapi/v1/txt2img`
+  - `/sdapi/v1/img2img`
+  - `/sdapi/v1/loras` - requires `model` in request body to fetch the correct loras
 - ✅ llama-swap API
   - `/ui` - web UI
   - `/upstream/:model_id` - direct access to upstream server ([demo](https://github.com/mostlygeek/llama-swap/pull/31))
@@ -41,14 +45,14 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
   - `/health` - just returns "OK"
 - ✅ API Key support - define keys to restrict access to API endpoints
 - ✅ Customizable
-  - Run multiple models at once with `Groups` ([#107](https://github.com/mostlygeek/llama-swap/issues/107))
+  - Run concurrent models with a custom DSL swap matrix ([#643](https://github.com/mostlygeek/llama-swap/issues/643))
   - Automatic unloading of models after timeout by setting a `ttl`
   - Reliable Docker and Podman support using `cmd` and `cmdStop` together
   - Preload models on startup with `hooks` ([#235](https://github.com/mostlygeek/llama-swap/pull/235))
 
 ### Web UI
 
-llama-swap includes a real time web interface with a playground for testing out all sorts of local models: 
+llama-swap includes a real time web interface with a playground for testing out all sorts of local models:
 
 <img width="1125" height="876" alt="image" src="https://github.com/user-attachments/assets/8ee41947-97af-463d-b0f0-8e9c478fac07" />
 
@@ -60,15 +64,13 @@ Inspect request and responses:
 
 <img width="1111" height="720" alt="image" src="https://github.com/user-attachments/assets/24fe4aca-1448-4d7c-b9e8-a967589bda6c" />
 
-Manually load and unload models: 
+Manually load and unload models:
 
 <img width="1109" height="719" alt="image" src="https://github.com/user-attachments/assets/02b1e1f2-abd0-4050-84ae-facd66ff01c4" />
 
-
-Real time log streaming: 
+Real time log streaming:
 
 <img width="1107" height="559" alt="image" src="https://github.com/user-attachments/assets/39669a10-cff2-409e-836a-5bad8bd0140c" />
-
 
 ## Installation
 
@@ -178,7 +180,7 @@ That's all you need to get started:
 Almost all configuration settings are optional and can be added one step at a time:
 
 - Advanced features
-  - `groups` to run multiple models at once
+  - `matrix` to run concurrent models with a custom swap logic DSL
   - `hooks` to run things on startup
   - `macros` reusable snippets
 - Model customization
@@ -196,7 +198,7 @@ See the [configuration documentation](docs/configuration.md) for all options.
 
 When a request is made to an OpenAI compatible endpoint, llama-swap will extract the `model` value and load the appropriate server configuration to serve it. If the wrong upstream server is running, it will be replaced with the correct one. This is where the "swap" part comes in. The upstream server is automatically swapped to handle the request correctly.
 
-In the most basic configuration llama-swap handles one model at a time. For more advanced use cases, the `groups` feature allows multiple models to be loaded at the same time. You have complete control over how your system resources are used.
+In the most basic configuration llama-swap handles one model at a time. For more advanced use cases, using a `matrix` allows multiple models to be loaded at the same time. You have complete control over how your system resources are used.
 
 ## Reverse Proxy Configuration (nginx)
 
