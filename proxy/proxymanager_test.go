@@ -1859,3 +1859,161 @@ models:
 		assert.Contains(t, w.Body.String(), "could not find suitable handler")
 	})
 }
+
+func TestProxyManager_AudioTranscriptionCapture(t *testing.T) {
+	cfg := testConfigFromYAML(t, `
+healthCheckTimeout: 15
+logLevel: error
+captureBuffer: 5
+models:
+  TheExpectedModel:
+    cmd: {{RESPONDER}} --port ${PORT} --silent --respond TheExpectedModel
+`)
+
+	proxy := New(cfg)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+	injectTestHandlers(proxy, nil)
+
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+
+	fw, err := w.CreateFormField("model")
+	assert.NoError(t, err)
+	_, err = fw.Write([]byte("TheExpectedModel"))
+	assert.NoError(t, err)
+
+	fw, err = w.CreateFormFile("file", "test.mp3")
+	assert.NoError(t, err)
+	_, err = fw.Write([]byte("test audio content"))
+	assert.NoError(t, err)
+	w.Close()
+
+	req := httptest.NewRequest("POST", "/v1/audio/transcriptions", &b)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer mysecret")
+	req.Header.Set("X-Custom-Req", "req-value")
+	rec := CreateTestResponseRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Verify capture exists
+	metrics := proxy.metricsMonitor.getMetrics()
+	assert.Equal(t, 1, len(metrics))
+	assert.True(t, metrics[0].HasCapture)
+
+	capture := proxy.metricsMonitor.getCaptureByID(metrics[0].ID)
+	assert.NotNil(t, capture)
+
+	// Should capture request headers (sensitive ones redacted)
+	assert.NotEmpty(t, capture.ReqHeaders)
+	assert.Equal(t, "[REDACTED]", capture.ReqHeaders["Authorization"])
+	assert.Equal(t, "req-value", capture.ReqHeaders["X-Custom-Req"])
+
+	// Should capture response headers
+	assert.NotNil(t, capture.RespHeaders)
+
+	// Should NOT capture request bodies but get response bodies (text
+	assert.Nil(t, capture.ReqBody)
+	assert.NotNil(t, capture.RespBody)
+}
+
+func TestProxyManager_VersionlessEndpoints_LocalModel(t *testing.T) {
+	cfg := testConfigFromYAML(t, `
+healthCheckTimeout: 15
+logLevel: error
+models:
+  model1:
+    cmd: {{RESPONDER}} --port ${PORT} --silent --respond model1
+`)
+
+	proxy := New(cfg)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+	injectTestHandlers(proxy, nil)
+
+	endpoints := []string{
+		"/v/chat/completions",
+		"/v/responses",
+		"/v/completions",
+		"/v/embeddings",
+		"/v/rerank",
+		"/v/reranking",
+	}
+
+	for _, endpoint := range endpoints {
+		t.Run(endpoint, func(t *testing.T) {
+			reqBody := `{"model":"model1"}`
+			req := httptest.NewRequest("POST", endpoint, bytes.NewBufferString(reqBody))
+			w := CreateTestResponseRecorder()
+			proxy.ServeHTTP(w, req)
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Contains(t, w.Body.String(), "model1")
+		})
+	}
+
+	t.Run("/v/messages", func(t *testing.T) {
+		reqBody := `{"model":"model1","messages":[{"role":"user","content":"hi"}]}`
+		req := httptest.NewRequest("POST", "/v/messages", bytes.NewBufferString(reqBody))
+		w := CreateTestResponseRecorder()
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), "model1")
+	})
+}
+
+func TestProxyManager_VersionlessEndpoints_PeerModel(t *testing.T) {
+	peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"endpoint":"%s","model":"peer-model"}`, r.URL.Path)
+	}))
+	defer peerServer.Close()
+
+	cfg := testConfigFromYAML(t, fmt.Sprintf(`
+healthCheckTimeout: 15
+logLevel: error
+peers:
+  test-peer:
+    proxy: %s
+    models:
+      - peer-model
+models:
+  local-model:
+    cmd: {{RESPONDER}} --port ${PORT} --silent --respond local-model
+`, peerServer.URL))
+
+	proxy := New(cfg)
+	defer proxy.StopProcesses(StopImmediately)
+
+	endpoints := []struct {
+		path       string
+		wantSuffix string
+	}{
+		{"/v/chat/completions", "/chat/completions"},
+		{"/v/responses", "/responses"},
+		{"/v/completions", "/completions"},
+		{"/v/embeddings", "/embeddings"},
+		{"/v/rerank", "/rerank"},
+		{"/v/reranking", "/reranking"},
+	}
+
+	for _, ep := range endpoints {
+		t.Run(ep.path, func(t *testing.T) {
+			reqBody := `{"model":"peer-model"}`
+			req := httptest.NewRequest("POST", ep.path, bytes.NewBufferString(reqBody))
+			w := CreateTestResponseRecorder()
+			proxy.ServeHTTP(w, req)
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Contains(t, w.Body.String(), ep.wantSuffix)
+		})
+	}
+
+	t.Run("/v/messages", func(t *testing.T) {
+		reqBody := `{"model":"peer-model","messages":[{"role":"user","content":"hi"}]}`
+		req := httptest.NewRequest("POST", "/v/messages", bytes.NewBufferString(reqBody))
+		w := CreateTestResponseRecorder()
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), "/messages")
+	})
+}

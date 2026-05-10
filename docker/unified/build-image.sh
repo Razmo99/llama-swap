@@ -287,9 +287,13 @@ ROOTLESS_TAG="${DOCKER_IMAGE_TAG}-rootless"
 docker buildx build --load -t "${ROOTLESS_TAG}" - <<EOF
 FROM ${DOCKER_IMAGE_TAG}
 USER root
-RUN groupadd --system --gid 10001 llama-swap && \\
-    useradd --system --uid 10001 --gid 10001 \\
-      --home /app --shell /sbin/nologin llama-swap && \\
+RUN if ! getent group llama-swap >/dev/null; then \\
+      groupadd --system --gid 10001 llama-swap; \\
+    fi && \\
+    if ! id -u llama-swap >/dev/null 2>&1; then \\
+      useradd --system --uid 10001 --gid llama-swap \\
+        --home /app --shell /sbin/nologin llama-swap; \\
+    fi && \\
     chown -R 10001:10001 /etc/llama-swap /models
 USER 10001
 EOF

@@ -8,9 +8,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mostlygeek/llama-swap/event"
+	"github.com/mostlygeek/llama-swap/internal/perf"
 )
 
 type Model struct {
@@ -38,6 +40,7 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.GET("/events", pm.apiSendEvents)
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
 		apiGroup.GET("/prometheus/http_sd", pm.apiGetPrometheusHTTPSD)
+		apiGroup.GET("/performance", pm.apiGetPerformance)
 		apiGroup.GET("/version", pm.apiGetVersion)
 		apiGroup.GET("/captures/:id", pm.apiGetCapture)
 	}
@@ -164,7 +167,7 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 		}
 	}
 
-	sendMetrics := func(metrics []TokenMetrics) {
+	sendMetrics := func(metrics []ActivityLogEntry) {
 		jsonData, err := json.Marshal(metrics)
 		if err == nil {
 			select {
@@ -211,8 +214,8 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 	/**
 	 * Send Metrics data
 	 */
-	defer event.On(func(e TokenMetricsEvent) {
-		sendMetrics([]TokenMetrics{e.Metrics})
+	defer event.On(func(e ActivityLogEvent) {
+		sendMetrics([]ActivityLogEntry{e.Metrics})
 	})()
 
 	/**
@@ -289,6 +292,56 @@ func (pm *ProxyManager) apiGetPrometheusHTTPSD(c *gin.Context) {
 	c.JSON(http.StatusOK, targetGroups)
 }
 
+func (pm *ProxyManager) prometheusMetricsHandler(c *gin.Context) {
+	if pm.perfMonitor == nil {
+		c.String(http.StatusServiceUnavailable, "# performance monitor not available\n")
+		return
+	}
+	pm.perfMonitor.MetricsHandler().ServeHTTP(c.Writer, c.Request)
+}
+
+func (pm *ProxyManager) apiGetPerformance(c *gin.Context) {
+	if pm.perfMonitor == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "performance monitor not available"})
+		return
+	}
+
+	sysStats, gpuStats := pm.perfMonitor.Current()
+
+	var after time.Time
+	if afterStr := c.Query("after"); afterStr != "" {
+		ts, err := time.Parse(time.RFC3339, afterStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid 'after' timestamp, use RFC3339 format"})
+			return
+		}
+		after = ts
+	}
+
+	if !after.IsZero() {
+		filtered := make([]perf.SysStat, 0, len(sysStats))
+		for _, s := range sysStats {
+			if s.Timestamp.After(after) {
+				filtered = append(filtered, s)
+			}
+		}
+		sysStats = filtered
+
+		filteredGpu := make([]perf.GpuStat, 0, len(gpuStats))
+		for _, g := range gpuStats {
+			if g.Timestamp.After(after) {
+				filteredGpu = append(filteredGpu, g)
+			}
+		}
+		gpuStats = filteredGpu
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"sys_stats": sysStats,
+		"gpu_stats": gpuStats,
+	})
+}
+
 func (pm *ProxyManager) apiUnloadSingleModelHandler(c *gin.Context) {
 	requestedModel := strings.TrimPrefix(c.Param("model"), "/")
 	realModelName, found := pm.config.RealModelName(requestedModel)
@@ -332,26 +385,16 @@ func (pm *ProxyManager) apiGetCapture(c *gin.Context) {
 		return
 	}
 
-	data, exists := pm.metricsMonitor.getCompressedBytes(id)
-	if !exists {
+	capture := pm.metricsMonitor.getCaptureByID(id)
+	if capture == nil || (capture.ReqPath == "" && capture.ReqHeaders == nil && capture.ReqBody == nil && capture.RespHeaders == nil && capture.RespBody == nil) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "capture not found"})
 		return
 	}
 
-	c.Header("Vary", "Accept-Encoding")
-
-	// ¯\_(ツ)_/¯ quality weights are too fancy for us anyway
-	hasZstd := strings.Contains(c.GetHeader("Accept-Encoding"), "zstd")
-
-	if hasZstd {
-		c.Header("Content-Encoding", "zstd")
-		c.Data(http.StatusOK, "application/json", data)
-	} else {
-		decompressed, err := decompressCapture(data)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to decompress capture"})
-			return
-		}
-		c.Data(http.StatusOK, "application/json", decompressed)
+	jsonBytes, err := json.Marshal(capture)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal capture"})
+		return
 	}
+	c.Data(http.StatusOK, "application/json", jsonBytes)
 }
