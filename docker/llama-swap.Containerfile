@@ -28,6 +28,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY event ./event
+COPY internal ./internal
 COPY proxy ./proxy
 COPY llama-swap.go ./
 COPY --from=ui-builder /src/proxy/ui_dist ./proxy/ui_dist
