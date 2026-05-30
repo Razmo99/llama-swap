@@ -15,7 +15,12 @@ WORKDIR /src/ui-svelte
 COPY ui-svelte/package.json ui-svelte/package-lock.json ./
 RUN npm ci
 COPY ui-svelte ./
-RUN mkdir -p /src/proxy && npm run build
+# Vite now writes to ../internal/server/ui_dist (was ../proxy/ui_dist before
+# the upstream UI move). Pre-create both targets so we can populate both
+# go:embed locations (internal/server/ui.go and proxy/ui_embed.go) in the
+# go-builder stage.
+RUN mkdir -p /src/internal/server /src/proxy && npm run build && \
+    cp -r /src/internal/server/ui_dist /src/proxy/ui_dist
 
 FROM golang:1.26.1-bookworm AS llama-swap-builder
 
@@ -27,10 +32,10 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
-COPY event ./event
 COPY internal ./internal
 COPY proxy ./proxy
 COPY llama-swap.go ./
+COPY --from=ui-builder /src/internal/server/ui_dist ./internal/server/ui_dist
 COPY --from=ui-builder /src/proxy/ui_dist ./proxy/ui_dist
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags "-s -w -X main.version=${LS_VER} -X main.commit=${GIT_HASH} -X main.date=${BUILD_DATE}" \
