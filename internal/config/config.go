@@ -223,11 +223,8 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	}
 
 	// Apply defaults for performance config when section is missing
-	if !config.Performance.Enable && config.Performance.Every == 0 && config.Performance.MaxAge == 0 && config.Performance.GC == 0 {
-		config.Performance.Enable = true
-		config.Performance.Every = 15 * time.Second
-		config.Performance.MaxAge = 1 * time.Hour
-		config.Performance.GC = 5 * time.Minute
+	if config.Performance.Every == 0 {
+		config.Performance.Every = 5 * time.Second
 	}
 	if err = config.Performance.Validate(); err != nil {
 		return Config{}, fmt.Errorf("performance: %w", err)
@@ -275,6 +272,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	nextPort := config.StartPort
 	for _, modelId := range modelIds {
 		modelConfig := config.Models[modelId]
+		modelConfig.HealthCheckTimeout = config.HealthCheckTimeout
 
 		// Strip comments from command fields
 		modelConfig.Cmd = StripComments(modelConfig.Cmd)

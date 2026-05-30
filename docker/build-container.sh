@@ -198,7 +198,8 @@ for CONTAINER_TYPE in non-root root; do
     --build-arg USER_HOME=${USER_HOME} --build-arg BASE_IMAGE=${BASE_IMAGE} \
     -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} ..
 
-  # For architectures with stable-diffusion.cpp support, layer sd-server on top
+  # For architectures with stable-diffusion.cpp support, layer sd-server on top.
+  # Stays on `docker build` so the base resolves from local dockerd.
   case "$ARCH" in
     "musa" | "vulkan")
       log_info "Adding sd-server to $CONTAINER_TAG"
@@ -209,7 +210,8 @@ for CONTAINER_TYPE in non-root root; do
         -t ${CONTAINER_TAG} -t ${CONTAINER_LATEST} . ;;
   esac
 
-  if [ "$PUSH_IMAGES" == "true" ]; then
+  # cpu builds push inline via buildx --push; all other archs push here.
+  if [ "$ARCH" != "cpu" ] && [ "$PUSH_IMAGES" == "true" ]; then
     docker push ${CONTAINER_TAG}
     docker push ${CONTAINER_LATEST}
   fi

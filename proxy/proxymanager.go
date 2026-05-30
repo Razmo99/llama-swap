@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
+	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/perf"
-	"github.com/mostlygeek/llama-swap/proxy/config"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -1199,7 +1199,7 @@ func (pm *ProxyManager) listRunningProcessesHandler(context *gin.Context) {
 			if process, ok := pm.matrix.GetProcess(modelID); ok {
 				runningProcesses = append(runningProcesses, gin.H{
 					"model":       process.ID,
-					"state":       process.state,
+					"state":       process.CurrentState(),
 					"cmd":         process.config.Cmd,
 					"proxy":       process.config.Proxy,
 					"ttl":         process.config.UnloadAfter,
@@ -1214,7 +1214,7 @@ func (pm *ProxyManager) listRunningProcessesHandler(context *gin.Context) {
 				if process.CurrentState() == StateReady {
 					runningProcesses = append(runningProcesses, gin.H{
 						"model":       process.ID,
-						"state":       process.state,
+						"state":       process.CurrentState(),
 						"cmd":         process.config.Cmd,
 						"proxy":       process.config.Proxy,
 						"ttl":         process.config.UnloadAfter,

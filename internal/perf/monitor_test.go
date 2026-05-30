@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
-	"github.com/mostlygeek/llama-swap/proxy/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -24,26 +24,19 @@ func TestNew_DefaultConfig(t *testing.T) {
 	require.NotNil(t, m)
 
 	assert.Equal(t, 100*time.Millisecond, m.conf.Every)
-	assert.Equal(t, 1*time.Second, m.conf.GC)
-	assert.Equal(t, 1*time.Minute, m.conf.MaxAge)
 }
 
 func TestNew_CustomConfig(t *testing.T) {
 	logger := newTestLogger()
 
 	cfg := config.PerformanceConfig{
-		Enable: true,
-		Every:  500 * time.Millisecond,
-		GC:     5 * time.Second,
-		MaxAge: 10 * time.Minute,
+		Every: 500 * time.Millisecond,
 	}
 
 	m, err := New(cfg, logger)
 	require.NoError(t, err)
 
 	assert.Equal(t, 500*time.Millisecond, m.conf.Every)
-	assert.Equal(t, 5*time.Second, m.conf.GC)
-	assert.Equal(t, 10*time.Minute, m.conf.MaxAge)
 }
 
 func TestNew_NilLogger(t *testing.T) {
@@ -56,18 +49,13 @@ func TestNew_BelowMinimumConfig(t *testing.T) {
 	logger := newTestLogger()
 
 	cfg := config.PerformanceConfig{
-		Enable: true,
-		Every:  1 * time.Millisecond,
-		GC:     100 * time.Millisecond,
-		MaxAge: 1 * time.Second,
+		Every: 1 * time.Millisecond,
 	}
 
 	m, err := New(cfg, logger)
 	require.NoError(t, err)
 
 	assert.Equal(t, 100*time.Millisecond, m.conf.Every)
-	assert.Equal(t, 1*time.Second, m.conf.GC)
-	assert.Equal(t, 1*time.Minute, m.conf.MaxAge)
 }
 
 func TestSubscribe_ReturnsChannels(t *testing.T) {
@@ -235,4 +223,44 @@ func TestCurrent_ConcurrentAccess(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestParseNvidiaSmiLine_ValidLine(t *testing.T) {
+	line := "0, NVIDIA GeForce RTX 3080, GPU-12345678-1234-1234-1234-123456789abc, 65, 80, 8192, 10240, 75, 250"
+
+	stat := ParseNvidiaSmiLine(line)
+	require.NotNil(t, stat)
+
+	assert.Equal(t, 0, stat.ID)
+	assert.Equal(t, "NVIDIA GeForce RTX 3080", stat.Name)
+	assert.Equal(t, "GPU-12345678-1234-1234-1234-123456789abc", stat.UUID)
+	assert.Equal(t, 65, stat.TempC)
+	assert.Equal(t, 80.0, stat.GpuUtilPct)
+	assert.Equal(t, 8192, stat.MemUsedMB)
+	assert.Equal(t, 10240, stat.MemTotalMB)
+	assert.Equal(t, 75.0, stat.FanSpeedPct)
+	assert.Equal(t, 250.0, stat.PowerDrawW)
+	assert.InDelta(t, 80.0, stat.MemUtilPct, 0.01)
+}
+
+func TestParseNvidiaSmiLine_ShortLine(t *testing.T) {
+	line := "0, NVIDIA GPU, GPU-123"
+
+	stat := ParseNvidiaSmiLine(line)
+	assert.Nil(t, stat)
+}
+
+func TestParseNvidiaSmiLine_MissingFields(t *testing.T) {
+	line := "0, NVIDIA GPU, GPU-123, 65, 80, 8192, 10240, 75"
+
+	stat := ParseNvidiaSmiLine(line)
+	assert.Nil(t, stat)
+}
+
+func TestParseNvidiaSmiLine_ZeroMemoryTotal(t *testing.T) {
+	line := "0, NVIDIA GPU, GPU-123, 65, 80, 0, 0, 75, 250"
+
+	stat := ParseNvidiaSmiLine(line)
+	require.NotNil(t, stat)
+	assert.Equal(t, 0.0, stat.MemUtilPct)
 }
