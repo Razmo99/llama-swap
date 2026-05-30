@@ -249,9 +249,8 @@ echo "=========================================="
 echo ""
 
 EXPECTED_BINARIES=(llama-server llama-cli whisper-server whisper-cli sd-server sd-cli llama-swap)
-if [[ "$BACKEND" == "cuda" ]]; then
-    EXPECTED_BINARIES+=(ik-llama-server)
-fi
+# Our fork dropped the ik_llama.cpp build stages in unified/Dockerfile, so
+# ik-llama-server is intentionally not produced — don't expect it.
 
 MISSING_BINARIES=()
 for binary in "${EXPECTED_BINARIES[@]}"; do
@@ -272,9 +271,6 @@ if [[ ${#MISSING_BINARIES[@]} -gt 0 ]]; then
 fi
 
 VERIFIED_LIST="llama-server, llama-cli, whisper-server, whisper-cli, sd-server, sd-cli, llama-swap"
-if [[ "$BACKEND" == "cuda" ]]; then
-    VERIFIED_LIST="${VERIFIED_LIST}, ik-llama-server"
-fi
 echo "All expected binaries verified: ${VERIFIED_LIST}"
 
 echo ""
