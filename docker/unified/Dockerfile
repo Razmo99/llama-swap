@@ -150,8 +150,12 @@ COPY --from=llama-build /install/bin/llama-server /usr/local/bin/
 COPY --from=llama-build /install/bin/llama-cli /usr/local/bin/
 COPY --from=llama-build /install/lib/ /usr/local/lib/
 
-# Install uv
-RUN pip install uv --break-system-packages
+# Install uv — copy the static binary from astral-sh's official image.
+# Previously used `pip install uv --break-system-packages`, but ubuntu:26.04's
+# python3-pip rejects --break-system-packages and PEP-668 blocks the unflagged
+# variant. The image copy is pip-free, cache-friendly, and pins to a known
+# release.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Copy llama-swap binary
 COPY --from=llama-swap-download /install/bin/llama-swap /usr/local/bin/
