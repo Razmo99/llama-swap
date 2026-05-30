@@ -117,13 +117,21 @@ fetch_llama_tag() {
             if [[ -n "$required_arch" ]]; then
                 local manifest
                 manifest=$(docker manifest inspect --verbose "${BASE_IMAGE}:${found_tag}" 2>/dev/null || true)
-                local manifest_arch
-                local manifest_os
-                manifest_arch=$(echo "$manifest" | jq -r '.Descriptor.platform.architecture // empty' 2>/dev/null || true)
-                manifest_os=$(echo "$manifest" | jq -r '.Descriptor.platform.os // empty' 2>/dev/null || true)
+                # `docker manifest inspect --verbose` returns a JSON array for
+                # multi-arch manifest lists (one entry per platform) and a JSON
+                # object for single-platform manifests. Upstream ggml-org cpu
+                # tags went multi-arch (amd64+arm64+s390x), so the old `.Descriptor.platform.architecture`
+                # access on the array root returned empty and every tag was skipped → 0 matches → exit 1.
+                local match
+                match=$(echo "$manifest" | jq -r --arg a "$required_arch" '
+                    (if type == "array" then .[] else . end)
+                    | .Descriptor.platform
+                    | select(.architecture == $a and .os == "linux")
+                    | .architecture
+                ' 2>/dev/null | head -1)
 
-                if [[ "$manifest_arch" != "$required_arch" || "$manifest_os" != "linux" ]]; then
-                    log_debug "Skipping tag $found_tag with platform ${manifest_os:-unknown}/${manifest_arch:-unknown}"
+                if [[ "$match" != "$required_arch" ]]; then
+                    log_debug "Skipping tag $found_tag — no $required_arch/linux variant"
                     continue
                 fi
             fi
