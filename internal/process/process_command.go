@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,20 +12,80 @@ import (
 	"os/exec"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
-	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 var ErrStartAborted = fmt.Errorf("aborted")
 
-type runReq struct {
+// healthCheckKey marks requests issued by the health check loop, which polls
+// the upstream through the same reverse proxy. Their failures are the expected
+// shape of a model still booting, so they must not be logged as proxy errors.
+type healthCheckKey struct{}
+
+// newProxyErrorHandler builds the ErrorHandler for a model's reverse proxy.
+//
+// httputil.ReverseProxy's default handler answers every failure with 502, so a
+// client hanging up mid-generation is logged as a Bad Gateway and sends
+// operators looking at an inference server that was healthy the whole time.
+// Cancellation is classified here, where the error is actually known: the
+// request is recorded with the client-closed sentinel rather than blamed on the
+// upstream, and at debug level because an impatient caller is normal traffic.
+// Real upstream failures keep the 502. See #1029.
+func newProxyErrorHandler(id string, proxyLogger *logmon.Monitor) func(http.ResponseWriter, *http.Request, error) {
+	return func(w http.ResponseWriter, r *http.Request, err error) {
+		// Pick the log level first: a cancelled request is never an upstream
+		// fault, whether or not the sentinel ends up applying below.
+		switch {
+		case errors.Is(err, context.Canceled) || r.Context().Err() != nil:
+			proxyLogger.Debugf("<%s> request cancelled: %v", id, err)
+		case r.Context().Value(healthCheckKey{}) != nil:
+			proxyLogger.Debugf("<%s> health check not ready: %v", id, err)
+		default:
+			proxyLogger.Warnf("<%s> proxy error: %v", id, err)
+		}
+
+		// Only a client that actually hung up gets the recorded-only sentinel.
+		// A request cancelled server-side (an operator cancelling it from the
+		// UI, or shutdown) still has a client waiting, and must be answered —
+		// otherwise net/http finalizes it as an empty 200, telling the caller
+		// the request succeeded.
+		if swaputil.MarkClientClosed(w, r) || swaputil.ResponseStarted(w) {
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}
+}
+
+// cmdWaitDelay is the upper bound the runtime will wait for child I/O to
+// drain after the process exits before force-closing the stdout/stderr
+// pipes. Required so that cmd.Wait() returns even when a forked grandchild
+// inherits and holds the pipes open (e.g. a shell wrapper that backgrounds
+// the real binary). killProcess sends the stop signal directly (not via the
+// cmd context), so this delay is measured from process exit rather than from
+// the stop request, and stays independent of the caller's graceful timeout.
+const cmdWaitDelay = 10 * time.Second
+
+// parentCancelGraceTimeout is the graceful timeout used when the process is
+// torn down because parentCtx was cancelled (final router teardown or app
+// shutdown). In the normal flow the process has already been stopped via
+// Stop() by this point, so killProcess is a no-op kill; the short grace just
+// bounds the rare case where a process is still alive when its context is cut.
+const parentCancelGraceTimeout = time.Second
+
+// startReq asks the run loop to bring the process up. Run and EnsureReady share
+// this one request type — and therefore one code path — so there is only ever a
+// single way to start a process. block selects the caller's semantics: Run parks
+// its response until the process terminates, EnsureReady is answered as soon as
+// the process is ready or the start fails.
+type startReq struct {
 	timeout time.Duration
 	respond chan error
+	block   bool
 }
 
 type stopReq struct {
@@ -39,6 +100,7 @@ type waitReadyReq struct {
 type startResult struct {
 	cmd       *exec.Cmd
 	cmdDone   chan struct{}
+	cancel    context.CancelFunc
 	handlerFn http.HandlerFunc
 	err       error
 }
@@ -51,18 +113,26 @@ type ProcessCommand struct {
 	processLogger *logmon.Monitor
 	proxyLogger   *logmon.Monitor
 
-	runCh       chan runReq
+	// waitDelay is assigned to cmd.WaitDelay when starting the upstream
+	// process. Defaults to cmdWaitDelay; tests override it to keep the
+	// pipe-close backstop from dominating their runtime.
+	waitDelay time.Duration
+
+	startCh     chan startReq
 	stopCh      chan stopReq
 	waitReadyCh chan waitReadyReq
 
-	// current ProcessState. Written only by run(); read by State() via atomic load.
-	state atomic.Value
+	// current Status. Written only by run(); read by State() and Status()
+	// via atomic load.
+	status atomic.Pointer[Status]
 
 	// stores the active reverse-proxy handler when the process is running.
 	// Written only by run(); read by ServeHTTP via atomic load.
 	handler atomic.Pointer[http.HandlerFunc]
 
-	lastUse  atomic.Int64 // unix nano timestamp of last ServeHTTP completion
+	// lastUse is the unix-nano timestamp of the most recent activity baseline.
+	// It is initialized when the process becomes Ready and updated after ServeHTTP completes.
+	lastUse  atomic.Int64
 	inflight atomic.Int64 // current in-flight ServeHTTP calls
 }
 
@@ -82,11 +152,12 @@ func New(
 		processLogger: processLogger,
 		proxyLogger:   proxyLogger,
 
-		runCh:       make(chan runReq),
+		startCh:     make(chan startReq),
 		stopCh:      make(chan stopReq),
 		waitReadyCh: make(chan waitReadyReq),
+		waitDelay:   cmdWaitDelay,
 	}
-	p.state.Store(StateStopped)
+	p.status.Store(&Status{State: StateStopped})
 
 	go p.run()
 	return p, nil
@@ -104,15 +175,23 @@ func (p *ProcessCommand) Logger() *logmon.Monitor { return p.processLogger }
 func (p *ProcessCommand) run() {
 	// Mutable state — only read/written from this goroutine. ServeHTTP reads
 	// p.handler concurrently, which is why handler is an atomic.Pointer.
-	// p.state mirrors `state` so State() can observe transitions; setState
+	// p.status mirrors `state` so State() can observe transitions; setState
 	// writes both.
 	state := StateStopped
 	setState := func(s ProcessState) {
 		old := state
 		state = s
-		p.state.Store(s)
+		next := &Status{State: s}
+		if s == StateReady {
+			if old == StateReady {
+				next.ReadySince = p.status.Load().ReadySince
+			} else {
+				next.ReadySince = time.Now()
+			}
+		}
+		p.status.Store(next)
 		if old != s {
-			event.Emit(shared.ProcessStateChangeEvent{
+			event.Emit(swaputil.ProcessStateChangeEvent{
 				ProcessName: p.id,
 				OldState:    string(old),
 				NewState:    string(s),
@@ -122,6 +201,7 @@ func (p *ProcessCommand) run() {
 	var (
 		cmd          *exec.Cmd
 		cmdDone      <-chan struct{}
+		cmdCancel    context.CancelFunc
 		readyWaiters []waitReadyReq
 		// runResp parks the in-flight Run caller's response channel. The
 		// interface contract is that Run blocks until the process is
@@ -131,8 +211,9 @@ func (p *ProcessCommand) run() {
 	)
 
 	// notifyWaiters wakes every blocked WaitReady caller with the given result.
-	// Used on transitions out of StateStarting (ready, failed, aborted, or
-	// shutdown) — anything that resolves the "is it ready yet?" question.
+	// It must be called on every transition into a state that resolves the
+	// "is it ready yet?" question — ready, failed, aborted, shutdown, stopped,
+	// or exited. Missing one strands the subscriber forever (issue #946).
 	notifyWaiters := func(err error) {
 		for _, w := range readyWaiters {
 			select {
@@ -164,9 +245,10 @@ func (p *ProcessCommand) run() {
 			setState(StateShutdown)
 			if cmd != nil {
 				p.handler.Store(nil)
-				p.killProcess(cmd, cmdDone, 100*time.Millisecond)
+				p.killProcess(cmd, cmdCancel, cmdDone, parentCancelGraceTimeout)
 				cmd = nil
 				cmdDone = nil
+				cmdCancel = nil
 			}
 			notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
 			respondRun(fmt.Errorf("[%s] shutdown", p.id))
@@ -177,10 +259,20 @@ func (p *ProcessCommand) run() {
 		// cmdDone is nil while no process is running, so this case is
 		// dormant outside of StateReady.
 		case <-cmdDone:
+			if cmdCancel != nil {
+				cmdCancel()
+			}
 			cmd = nil
 			cmdDone = nil
+			cmdCancel = nil
 			p.handler.Store(nil)
 			setState(StateStopped)
+			p.proxyLogger.Warnf("<%s> upstream process exited unexpectedly", p.id)
+			// Safety net: readyWaiters is normally empty here because
+			// WaitReady is answered immediately while StateReady. Notifying
+			// anyway keeps the invariant that no transition into a settled
+			// state can leave a subscriber parked forever.
+			notifyWaiters(fmt.Errorf("[%s] upstream exited unexpectedly", p.id))
 			respondRun(fmt.Errorf("[%s] upstream exited unexpectedly", p.id))
 
 		// WaitReady: if we're already in a terminal-for-this-question state,
@@ -196,12 +288,31 @@ func (p *ProcessCommand) run() {
 				readyWaiters = append(readyWaiters, req)
 			}
 
-		// Run: start the upstream process. Only valid from StateStopped.
+		// Start the upstream process (Run or EnsureReady — see startReq).
 		// doStart can take a long time (health-check polling), so it runs in
 		// a separate goroutine and we wait on resultCh. While waiting we also
 		// listen for an incoming Stop — that's how callers cancel an in-flight
 		// start.
-		case req := <-p.runCh:
+		case req := <-p.startCh:
+			// EnsureReady answers straight from the current state when the
+			// "is it ready?" question is already settled. There is deliberately
+			// no StateStopping case: a stop keeps this loop parked inside
+			// killProcess and out of the select, so a request can only ever be
+			// received once the stop has finished and state is Stopped again.
+			// Waiting on the channel IS the synchronisation — the caller never
+			// has to guess the state from outside.
+			if !req.block {
+				switch state {
+				case StateReady:
+					req.respond <- nil
+					continue
+				case StateShutdown:
+					req.respond <- fmt.Errorf("[%s] shutdown", p.id)
+					continue
+				}
+			}
+			// Only valid from StateStopped. For Run this is also the "second
+			// Run while already running" rejection.
 			if state != StateStopped {
 				req.respond <- fmt.Errorf("[%s] could not be started in %s state", p.id, state)
 				continue
@@ -226,14 +337,24 @@ func (p *ProcessCommand) run() {
 				if res.err == nil {
 					cmd = res.cmd
 					cmdDone = res.cmdDone
+					cmdCancel = res.cancel
 					fn := res.handlerFn
 					p.handler.Store(&fn)
+					// A newly ready process starts a fresh idle window. Without this,
+					// lastUse is zero on first start or stale after a restart, so TTL
+					// can unload it on the first one-second ticker tick.
+					p.lastUse.Store(time.Now().UnixNano())
 					setState(StateReady)
 					notifyWaiters(nil)
-					// Park the Run response — Run blocks until the process
-					// terminates, so we only fire this when Stop, parentCtx,
-					// or the upstream exit takes the process down.
-					runResp = req.respond
+					if req.block {
+						// Park the Run response — Run blocks until the process
+						// terminates, so we only fire this when Stop, parentCtx,
+						// or the upstream exit takes the process down.
+						runResp = req.respond
+					} else {
+						// EnsureReady's question is answered: it's ready.
+						req.respond <- nil
+					}
 
 					// Start TTL goroutine if configured — self-terminates
 					// when state leaves StateReady.
@@ -251,7 +372,7 @@ func (p *ProcessCommand) run() {
 								}
 								if time.Since(time.Unix(0, p.lastUse.Load())) > ttlDuration {
 									p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.id, p.config.UnloadAfter)
-									p.Stop(10 * time.Second)
+									p.Stop(time.Duration(p.config.UnloadTimeout) * time.Second)
 									return
 								}
 							}
@@ -273,7 +394,7 @@ func (p *ProcessCommand) run() {
 				cancelStart()
 				res := <-resultCh
 				if res.cmd != nil {
-					p.killProcess(res.cmd, res.cmdDone, stop.timeout)
+					p.killProcess(res.cmd, res.cancel, res.cmdDone, stop.timeout)
 				}
 				setState(StateStopped)
 				notifyWaiters(ErrStartAborted)
@@ -293,7 +414,7 @@ func (p *ProcessCommand) run() {
 				setState(StateShutdown)
 				res := <-resultCh
 				if res.cmd != nil {
-					p.killProcess(res.cmd, res.cmdDone, 100*time.Millisecond)
+					p.killProcess(res.cmd, res.cancel, res.cmdDone, parentCancelGraceTimeout)
 				}
 				notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
 				respondRun(fmt.Errorf("[%s] shutdown", p.id))
@@ -308,16 +429,27 @@ func (p *ProcessCommand) run() {
 
 		// Stop: tear down a running process.
 		case stop := <-p.stopCh:
+			toreDown := cmd != nil
 			if cmd != nil {
 				setState(StateStopping)
-				p.killProcess(cmd, cmdDone, stop.timeout)
+				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout)
 				cmd = nil
 				cmdDone = nil
+				cmdCancel = nil
 				p.handler.Store(nil)
 			}
 			// Stop is a no-op (and not an error) when already Stopped — this
 			// is what makes it idempotent for callers that don't track state.
 			setState(StateStopped)
+			if toreDown {
+				// A process we just killed is not going to become ready, so
+				// release anyone parked on that question rather than leaving
+				// them stranded (issue #946). Guarded on having actually torn
+				// something down: an idempotent no-op Stop must not cancel a
+				// subscriber waiting on a start that hasn't happened yet, which
+				// is the legitimate `go Run(); WaitReady()` ordering.
+				notifyWaiters(fmt.Errorf("[%s] stopped", p.id))
+			}
 			respondRun(nil)
 			stop.respond <- nil
 		}
@@ -354,7 +486,13 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       time.Duration(p.config.Timeouts.IdleConn) * time.Second,
 	}
+	reverseProxy.ErrorHandler = newProxyErrorHandler(p.id, p.proxyLogger)
 	reverseProxy.ModifyResponse = func(resp *http.Response) error {
+		// Upstreams such as llama-server set their own CORS headers, and
+		// ReverseProxy adds rather than replaces them, so both llama-swap's
+		// and the upstream's would be sent. Keep only ours; see issue #85.
+		swaputil.StripUpstreamCORSHeaders(resp.Header)
+
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			resp.Header.Set("X-Accel-Buffering", "no")
 		}
@@ -377,46 +515,71 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		reverseProxy.ServeHTTP(w, r)
 	})
 
-	cmd := exec.Command(args[0], args[1:]...)
+	// cmdCtx + cmd.Cancel are wired as a safety net: if the context is ever
+	// cancelled while the process is alive, cmd.Cancel sends SIGTERM / CmdStop
+	// and the runtime escalates to SIGKILL after cmd.WaitDelay. In the normal
+	// teardown path killProcess sends the stop signal directly instead, so
+	// cmd.WaitDelay only acts as the inherited-pipe backstop measured from
+	// process exit (see killProcess).
+	cmdCtx, cmdCancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
 	cmd.Stderr = p.processLogger
 	cmd.Stdout = p.processLogger
 	cmd.Env = append(cmd.Environ(), p.config.Env...)
+	cmd.Cancel = func() error { return p.sendStopSignal(cmd) }
+	cmd.WaitDelay = p.waitDelay
 	setProcAttributes(cmd)
 
 	p.proxyLogger.Debugf("<%s> Executing start command: %s, env: %s", p.id, strings.Join(args, " "), strings.Join(p.config.Env, ", "))
 
 	cmdDone := make(chan struct{})
 	if err := cmd.Start(); err != nil {
+		cmdCancel()
 		return startResult{err: fmt.Errorf("failed to start command '%s': %w", strings.Join(args, " "), err)}
 	}
 
 	go func() {
 		waitErr := cmd.Wait()
-		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			p.proxyLogger.Debugf("<%s> process exited: code=%d, err=%v", p.id, exitErr.ExitCode(), waitErr)
-		} else if waitErr != nil {
-			p.proxyLogger.Debugf("<%s> process exited with error: %v", p.id, waitErr)
-		} else {
+		switch st := p.State(); {
+		case waitErr == nil:
 			p.proxyLogger.Debugf("<%s> process exited cleanly", p.id)
+		case st == StateStopping || st == StateShutdown:
+			// Expected: we force-terminated the process. A forced kill exits
+			// the child with a non-zero code (e.g. taskkill /f on Windows
+			// yields exit status 1), so this is not an error.
+			p.proxyLogger.Debugf("<%s> process stopped by llama-swap: %v", p.id, waitErr)
+		default:
+			if exitErr, ok := waitErr.(*exec.ExitError); ok {
+				p.proxyLogger.Debugf("<%s> process exited: code=%d, err=%v", p.id, exitErr.ExitCode(), waitErr)
+			} else {
+				p.proxyLogger.Debugf("<%s> process exited with error: %v", p.id, waitErr)
+			}
 		}
 		close(cmdDone)
 	}()
 
+	abort := func(err error) startResult {
+		p.killProcess(cmd, cmdCancel, cmdDone, 5*time.Second)
+		return startResult{err: err}
+	}
+	prematureExit := func() startResult {
+		cmdCancel()
+		return startResult{err: fmt.Errorf("upstream command exited prematurely")}
+	}
+
 	if startCtx.Err() != nil {
-		p.killProcess(cmd, cmdDone, 5*time.Second)
-		return startResult{err: ErrStartAborted}
+		return abort(ErrStartAborted)
 	}
 
 	checkEndpoint := strings.TrimSpace(p.config.CheckEndpoint)
 	if checkEndpoint == "none" {
-		return startResult{cmd: cmd, cmdDone: cmdDone, handlerFn: handlerFn}
+		return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
 	}
 
 	// Wait 250ms for the command to start up before health checking
 	select {
 	case <-startCtx.Done():
-		p.killProcess(cmd, cmdDone, 5*time.Second)
-		return startResult{err: ErrStartAborted}
+		return abort(ErrStartAborted)
 	case <-time.After(250 * time.Millisecond):
 	}
 
@@ -424,19 +587,20 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	for {
 		select {
 		case <-startCtx.Done():
-			p.killProcess(cmd, cmdDone, 5*time.Second)
-			return startResult{err: ErrStartAborted}
+			return abort(ErrStartAborted)
 		case <-cmdDone:
-			return startResult{err: fmt.Errorf("upstream command exited prematurely")}
+			return prematureExit()
 		default:
 		}
 
 		if time.Now().After(deadline) {
-			p.killProcess(cmd, cmdDone, 5*time.Second)
-			return startResult{err: fmt.Errorf("health check timed out after %v", healthCheckTimeout)}
+			return abort(fmt.Errorf("health check timed out after %v", healthCheckTimeout))
 		}
 
-		req, _ := http.NewRequestWithContext(startCtx, "GET", p.config.CheckEndpoint, nil)
+		// Tagged so the proxy ErrorHandler logs a not-yet-listening upstream
+		// at debug rather than as a proxy error once per poll.
+		checkCtx := context.WithValue(startCtx, healthCheckKey{}, true)
+		req, _ := http.NewRequestWithContext(checkCtx, "GET", p.config.CheckEndpoint, nil)
 		rr := httptest.NewRecorder()
 		reverseProxy.ServeHTTP(rr, req)
 		resp := rr.Result()
@@ -445,42 +609,110 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 			p.proxyLogger.Infof("<%s> Health check passed on %s%s", p.id, p.config.Proxy, p.config.CheckEndpoint)
 			break
 		} else if startCtx.Err() != nil {
-			p.killProcess(cmd, cmdDone, 5*time.Second)
-			return startResult{err: ErrStartAborted}
+			return abort(ErrStartAborted)
 		}
 
 		select {
 		case <-startCtx.Done():
-			p.killProcess(cmd, cmdDone, 5*time.Second)
-			return startResult{err: ErrStartAborted}
+			return abort(ErrStartAborted)
 		case <-cmdDone:
-			return startResult{err: fmt.Errorf("upstream command exited prematurely")}
+			return prematureExit()
 		case <-time.After(time.Second):
 		}
 	}
 
-	return startResult{cmd: cmd, cmdDone: cmdDone, handlerFn: handlerFn}
+	return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
 }
 
-func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cmdDone <-chan struct{}, gracefulTimeout time.Duration) {
+// sendStopSignal runs the configured CmdStop (if any) or sends SIGTERM to
+// the upstream process. Wired up as cmd.Cancel so it fires whenever the
+// cmd's context is cancelled.
+func (p *ProcessCommand) sendStopSignal(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
-		return
+		p.processLogger.Debugf("<%s> sendStopSignal() called with nil cmd or process, nothing to stop", p.id)
+		return nil
 	}
-
+	pid := cmd.Process.Pid
 	if p.config.CmdStop != "" {
+		p.processLogger.Debugf("<%s> sendStopSignal() using CmdStop %q for pid %d", p.id, p.config.CmdStop, pid)
 		stopArgs, err := config.SanitizeCommand(
-			strings.ReplaceAll(p.config.CmdStop, "${PID}", fmt.Sprintf("%d", cmd.Process.Pid)),
+			strings.ReplaceAll(p.config.CmdStop, "${PID}", fmt.Sprintf("%d", pid)),
 		)
 		if err == nil {
+			p.processLogger.Debugf("<%s> sendStopSignal() running stop command: %s", p.id, strings.Join(stopArgs, " "))
 			stopCmd := exec.Command(stopArgs[0], stopArgs[1:]...)
+			stopCmd.Stderr = p.processLogger
+			stopCmd.Stdout = p.processLogger
+			// Bound the pipe copy so a CmdStop that backgrounds a child
+			// holding stdout/stderr cannot block Run() indefinitely.
+			stopCmd.WaitDelay = p.waitDelay
 			stopCmd.Env = cmd.Env
 			setProcAttributes(stopCmd)
-			stopCmd.Run()
-		} else {
-			cmd.Process.Signal(syscall.SIGTERM)
+			runErr := stopCmd.Run()
+			// ErrWaitDelay is only returned when the stop command itself
+			// succeeded, so it is not a failure to stop the process.
+			if errors.Is(runErr, exec.ErrWaitDelay) {
+				p.processLogger.Warnf("<%s> sendStopSignal() stop command exited but a child held its output open; output may be truncated", p.id)
+				runErr = nil
+			}
+			if runErr != nil {
+				p.processLogger.Errorf("<%s> sendStopSignal() stop command failed: %v", p.id, runErr)
+			} else {
+				p.processLogger.Debugf("<%s> sendStopSignal() stop command completed for pid %d", p.id, pid)
+			}
+			return runErr
 		}
-	} else {
-		cmd.Process.Signal(syscall.SIGTERM)
+		// fall through to SIGTERM if sanitize failed
+		p.processLogger.Errorf("<%s> sendStopSignal() failed to sanitize CmdStop %q: %v, falling back to terminateProcessTree", p.id, p.config.CmdStop, err)
+	}
+	// On Unix this SIGTERMs the whole process group so a forked grandchild
+	// (e.g. a shell wrapper that backgrounds the real binary) is taken down
+	// with the parent rather than orphaned.
+	p.processLogger.Debugf("<%s> sendStopSignal() no CmdStop configured, calling terminateProcessTree for pid %d", p.id, pid)
+	termErr := terminateProcessTree(cmd)
+	if termErr != nil {
+		p.processLogger.Errorf("<%s> sendStopSignal() terminateProcessTree failed for pid %d: %v", p.id, pid, termErr)
+	}
+	return termErr
+}
+
+// killProcess terminates the upstream process. The flow:
+//
+//  1. Send the graceful stop signal (CmdStop / SIGTERM) directly — NOT by
+//     cancelling cmdCtx. Cancelling the context would start cmd.WaitDelay
+//     immediately, which force-kills the process WaitDelay after the signal
+//     and would silently cap gracefulTimeout at WaitDelay whenever
+//     gracefulTimeout is the longer of the two.
+//  2. We wait up to gracefulTimeout for the process to exit on its own.
+//  3. If still alive, we SIGKILL the process group directly (Unix) so any
+//     forked descendant is force-terminated alongside the parent.
+//  4. We wait on cmdDone. cmd.WaitDelay (set when the cmd was built) is the
+//     critical backstop here: once the process exits, if a forked grandchild
+//     inherited the stdout/stderr pipes and is still holding them, the runtime
+//     force-closes the pipes WaitDelay after the exit and cmd.Wait() unblocks.
+//     Because we never cancelled the context, that WaitDelay timer measures
+//     from process exit (see os/exec awaitGoroutines), not from this call.
+//     Without WaitDelay this select would hang forever (the v219 bug).
+//
+// cancel() is still invoked (deferred) to release the context, but only after
+// the process has exited and os/exec's ctx watcher has already torn down, so it
+// never re-fires cmd.Cancel.
+func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cancel context.CancelFunc, cmdDone <-chan struct{}, gracefulTimeout time.Duration) {
+	if cancel == nil {
+		return
+	}
+	defer cancel()
+
+	// Deliver CmdStop / SIGTERM in a goroutine so a slow or hanging CmdStop
+	// cannot block the run() goroutine; the gracefulTimeout + Process.Kill
+	// path below still guarantees teardown.
+	if cmd != nil {
+		go func() {
+			p.proxyLogger.Debugf("[%s] sending stop signal with timeout %v", p.id, gracefulTimeout)
+			if err := p.sendStopSignal(cmd); err != nil {
+				p.proxyLogger.Warnf("[%s] stop signal failed: %v", p.id, err)
+			}
+		}()
 	}
 
 	timer := time.NewTimer(gracefulTimeout)
@@ -488,10 +720,16 @@ func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cmdDone <-chan struct{}, gra
 
 	select {
 	case <-cmdDone:
+		return
 	case <-timer.C:
-		cmd.Process.Kill()
-		<-cmdDone
 	}
+
+	if cmd != nil {
+		// SIGKILL the whole process group on Unix so any descendant that
+		// ignored or outlived the graceful signal is force-terminated too.
+		_ = killProcessTree(cmd)
+	}
+	<-cmdDone
 }
 
 func (p *ProcessCommand) ID() string {
@@ -499,18 +737,49 @@ func (p *ProcessCommand) ID() string {
 }
 
 func (p *ProcessCommand) Run(timeout time.Duration) error {
-	req := runReq{
+	req := startReq{
 		timeout: timeout,
 		respond: make(chan error, 1),
+		block:   true,
 	}
 	select {
-	case p.runCh <- req:
+	case p.startCh <- req:
 	case <-p.parentCtx.Done():
 		return fmt.Errorf("[%s] shutdown", p.id)
 	}
 	select {
 	case err := <-req.respond:
 		return err
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+}
+
+// EnsureReady brings the process to a ready state and blocks until it is
+// serving. See the Process interface for the full state-by-state contract.
+//
+// The send on startCh is the synchronisation point: it can only be received
+// when the run loop is back at its select, so a stop that is still in progress
+// naturally holds the request until the process is really stopped. Callers must
+// not inspect State() first — that read races the run loop and is what caused
+// issue #946.
+func (p *ProcessCommand) EnsureReady(ctx context.Context, timeout time.Duration) error {
+	req := startReq{
+		timeout: timeout,
+		respond: make(chan error, 1),
+	}
+	select {
+	case p.startCh <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.parentCtx.Done():
+		return fmt.Errorf("[%s] shutdown", p.id)
+	}
+	select {
+	case err := <-req.respond:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-p.parentCtx.Done():
 		return fmt.Errorf("[%s] shutdown", p.id)
 	}
@@ -547,16 +816,24 @@ func (p *ProcessCommand) Stop(timeout time.Duration) error {
 }
 
 func (p *ProcessCommand) State() ProcessState {
-	if s, ok := p.state.Load().(ProcessState); ok {
-		return s
+	return p.Status().State
+}
+
+func (p *ProcessCommand) Status() Status {
+	if st := p.status.Load(); st != nil {
+		return *st
 	}
-	return StateStopped
+	return Status{State: StateStopped}
 }
 
 func (p *ProcessCommand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fn := p.handler.Load()
 	if fn == nil {
-		http.Error(w, fmt.Sprintf("llama-swap-error: [%s] process is not ready", p.id), http.StatusServiceUnavailable)
+		swaputil.SendResponse(w, r, http.StatusServiceUnavailable, fmt.Sprintf("[%s] process is not ready", p.id))
+		return
+	}
+	if p.config.Compat.IgnoreWebsockets && swaputil.IsWebSocketUpgrade(r) {
+		(*fn)(w, r)
 		return
 	}
 	p.inflight.Add(1)

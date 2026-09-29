@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
 var loadingPaths = []string{
@@ -38,6 +39,13 @@ type loadingWriter struct {
 	pendingMu     sync.Mutex
 	pendingUpdate string
 
+	// writeMu serializes writes to the underlying writer and guards released.
+	// Once released is set, the streaming goroutine must not touch the writer
+	// again — ServeHTTP has reclaimed it (to run the real handler or to return)
+	// and writing/flushing a finalized response panics.
+	writeMu  sync.Mutex
+	released bool
+
 	// closed by start when the goroutine finishes (after cleanup messages)
 	done chan struct{}
 
@@ -59,6 +67,7 @@ func newLoadingWriter(logger *logmon.Monitor, modelName string, w http.ResponseW
 		startTime:     time.Now(),
 		tickDuration:  750 * time.Millisecond,
 		charPerSecond: 75,
+		done:          make(chan struct{}),
 	}
 
 	s.Header().Set("Content-Type", "text/event-stream")
@@ -77,7 +86,6 @@ func (s *loadingWriter) setUpdate(msg string) {
 }
 
 func (s *loadingWriter) start(ctx context.Context) {
-	s.done = make(chan struct{})
 	defer close(s.done)
 
 	defer func() {
@@ -217,12 +225,68 @@ func (s *loadingWriter) sendData(data string) {
 		return
 	}
 
-	_, err = fmt.Fprintf(s.writer, "data: %s\n\n", jsonData)
-	if err != nil {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	// Once ServeHTTP has reclaimed the writer (release), writing/flushing it
+	// races the real handler or panics on a finalized response. Stop here.
+	if s.released {
+		return
+	}
+
+	if _, err = fmt.Fprintf(s.writer, "data: %s\n\n", jsonData); err != nil {
 		s.logger.Debugf("<%s> Failed to write SSE data (client likely disconnected): %v", s.modelName, err)
 		return
 	}
-	s.Flush()
+	if flusher, ok := s.writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// sendError streams err to the client as a terminating SSE error frame
+// followed by [DONE].
+//
+// Once the loading stream has committed its 200, a real status can no longer be
+// sent: swaputil.SendError's WriteHeader is dropped and its JSON body lands in
+// the stream as a bare line, which every SSE parser discards silently (the text
+// before the first colon is read as an unknown field name). The client is left
+// with a truncated stream, no [DONE], and no reason — the same
+// failure-reported-as-success shape as #1029. Framing the error keeps it
+// visible.
+//
+// The frame carries the same envelope as a non-streamed error body (#1038), so
+// a client sees one error shape either way. The status only selects the
+// envelope's type/code — 500 matches what this error would have been answered
+// with had the stream not already committed a 200.
+//
+// Must be called before release, while writes still reach the client.
+func (s *loadingWriter) sendError(err error) {
+	jsonData := swaputil.NewErrorEnvelope(http.StatusInternalServerError, err.Error(), "").JSON()
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.released {
+		return
+	}
+
+	if _, werr := fmt.Fprintf(s.writer, "data: %s\n\ndata: [DONE]\n\n", jsonData); werr != nil {
+		s.logger.Debugf("<%s> Failed to write SSE error (client likely disconnected): %v", s.modelName, werr)
+		return
+	}
+	if flusher, ok := s.writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// release fences the loadingWriter off from the underlying ResponseWriter.
+// After it returns, the streaming goroutine will not write to or flush the
+// writer again: any in-flight write completes under writeMu first, and later
+// writes short-circuit on released. The caller can then safely hand the writer
+// to the real handler or let ServeHTTP return without racing a finalized
+// response (a use-after-return Flush panics on the recycled *bufio.Writer).
+func (s *loadingWriter) release() {
+	s.writeMu.Lock()
+	s.released = true
+	s.writeMu.Unlock()
 }
 
 func (s *loadingWriter) Header() http.Header {

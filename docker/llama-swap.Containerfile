@@ -1,7 +1,7 @@
 ARG BASE_IMAGE=ghcr.io/ggml-org/llama.cpp
 ARG BASE_TAG=server-cuda
 
-FROM golang:1.26.1-bookworm AS compose-config-gen-builder
+FROM golang:1.27.1-bookworm AS compose-config-gen-builder
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -11,18 +11,16 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/compose-config-gen ./
 
 FROM node:25-bookworm-slim AS ui-builder
 
-WORKDIR /src/ui-svelte
-COPY ui-svelte/package.json ui-svelte/package-lock.json ./
+WORKDIR /src/ui
+COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
-COPY ui-svelte ./
-# Vite now writes to ../internal/server/ui_dist (was ../proxy/ui_dist before
-# the upstream UI move). Pre-create both targets so we can populate both
-# go:embed locations (internal/server/ui.go and proxy/ui_embed.go) in the
-# go-builder stage.
-RUN mkdir -p /src/internal/server /src/proxy && npm run build && \
-    cp -r /src/internal/server/ui_dist /src/proxy/ui_dist
+COPY ui ./
+# Vite writes the production build to ../internal/server/ui_dist
+# (ui/vite.config.ts outDir). The `embed_ui` build tag embeds that
+# directory into the binary (internal/server/embed.go).
+RUN npm run build
 
-FROM golang:1.26.1-bookworm AS llama-swap-builder
+FROM golang:1.27.1-bookworm AS llama-swap-builder
 
 ARG GIT_HASH=unknown
 ARG BUILD_DATE=unknown
@@ -33,11 +31,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-COPY proxy ./proxy
+COPY docs ./docs
+COPY config-schema.json ./
 COPY llama-swap.go ./
 COPY --from=ui-builder /src/internal/server/ui_dist ./internal/server/ui_dist
-COPY --from=ui-builder /src/proxy/ui_dist ./proxy/ui_dist
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embed_ui \
     -ldflags "-s -w -X main.version=${LS_VER} -X main.commit=${GIT_HASH} -X main.date=${BUILD_DATE}" \
     -o /out/llama-swap .
 
