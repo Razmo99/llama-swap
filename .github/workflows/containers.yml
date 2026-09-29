@@ -25,12 +25,13 @@ on:
       - 'docker/*.Containerfile'
       - 'docker/config.example.yaml'
       - 'cmd/**/*.go'
-      - 'event/**/*.go'
-      - 'proxy/**/*.go'
-      - 'ui-svelte/**'
+      - 'internal/**/*.go'
       - 'llama-swap.go'
       - 'go.mod'
       - 'go.sum'
+      - 'ui/**'
+      - 'docs/**'
+      - 'config-schema.json'
 
 # grant permissions on GITHUB_TOKEN to publish packages
 # ref: https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions#publishing-a-package-using-an-action
