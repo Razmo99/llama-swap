@@ -4,6 +4,9 @@
 #   version: release version number (e.g., "170") or "latest" (default)
 set -e
 
+# shellcheck source=lib-release.sh
+source "$(dirname "$0")/lib-release.sh"
+
 VERSION="${1:-latest}"
 REPO="${LLAMA_SWAP_REPO_NAME:-}"
 
@@ -34,8 +37,7 @@ VERSION="${VERSION#v}"
 # Resolve "latest" to actual version number
 if [ "$VERSION" = "latest" ]; then
     echo "=== Resolving latest llama-swap release ==="
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
+    VERSION=$(resolve_latest_version "${REPO}")
     if [ -z "$VERSION" ]; then
         echo "FATAL: Could not determine latest release version" >&2
         exit 1
